@@ -1,3 +1,8 @@
+# *SUNSET NOTICE*
+*Support and development of Interactive Medical Simulation Toolkit (iMSTK)
+has been discontinued as of May-02-2025. This project is no longer under
+active development or support.*
+
 # iMSTK - Interactive Medical Simulation Toolkit
 * [About](#about)
   * [Overview](#overview)
