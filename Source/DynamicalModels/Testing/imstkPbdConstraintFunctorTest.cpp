@@ -8,6 +8,7 @@
 
 #include "imstkLineMesh.h"
 #include "imstkPbdConstraintFunctor.h"
+#include "imstkPbdConstraintContainer.h"
 #include "imstkVecDataArray.h"
 
 using namespace imstk;
@@ -133,6 +134,65 @@ TEST(imstkPbdConstraintFunctorTest, TestDistanceConstraintGeneration)
     EXPECT_EQ(constraint->getParticles().size(), 2);
     EXPECT_EQ(constraint->getParticles()[0].second, 0);
     EXPECT_EQ(constraint->getParticles()[1].second, 1);
+}
+
+TEST(imstkPbdConstraintFunctorTest, TestDistanceConstraintIndexesLineEdges)
+{
+    auto lineMesh = std::make_shared<LineMesh>();
+    auto vertices = std::make_shared<VecDataArray<double, 3>>(3);
+    (*vertices)[0] = Vec3d(0.0, 0.0, 0.0);
+    (*vertices)[1] = Vec3d(1.0, 0.0, 0.0);
+    (*vertices)[2] = Vec3d(2.0, 0.0, 0.0);
+    auto indices = std::make_shared<VecDataArray<int, 2>>(2);
+    (*indices)[0] = Vec2i(0, 1);
+    (*indices)[1] = Vec2i(1, 2);
+    lineMesh->initialize(vertices, indices);
+
+    PbdDistanceConstraintFunctor constraintFunctor;
+    constraintFunctor.setStiffness(1.0e3);
+    constraintFunctor.setBodyIndex(7);
+    constraintFunctor.setGeometry(lineMesh);
+
+    PbdConstraintContainer container;
+    constraintFunctor(container);
+
+    EXPECT_EQ(container.getConstraintsForEdge(7, 0, 1).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(7, 1, 0).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(7, 1, 2).size(), 1);
+    EXPECT_TRUE(container.getConstraintsForEdge(8, 0, 1).empty());
+
+    EXPECT_EQ(container.deactivateConstraintsForEdge(7, 0, 1), 1);
+    EXPECT_FALSE(container.getConstraintsForEdge(7, 0, 1)[0]->isActive());
+    EXPECT_EQ(container.deactivateConstraintsForEdge(7, 0, 1), 0);
+}
+
+TEST(imstkPbdConstraintFunctorTest, TestDistanceConstraintIndexesUniqueTetEdges)
+{
+    auto tetMesh = std::make_shared<TetrahedralMesh>();
+    auto vertices = std::make_shared<VecDataArray<double, 3>>(4);
+    (*vertices)[0] = Vec3d(0.0, 0.0, 0.0);
+    (*vertices)[1] = Vec3d(1.0, 0.0, 0.0);
+    (*vertices)[2] = Vec3d(0.0, 1.0, 0.0);
+    (*vertices)[3] = Vec3d(0.0, 0.0, 1.0);
+    auto indices = std::make_shared<VecDataArray<int, 4>>(1);
+    (*indices)[0] = Vec4i(0, 1, 2, 3);
+    tetMesh->initialize(vertices, indices);
+
+    PbdDistanceConstraintFunctor constraintFunctor;
+    constraintFunctor.setStiffness(1.0e3);
+    constraintFunctor.setBodyIndex(3);
+    constraintFunctor.setGeometry(tetMesh);
+
+    PbdConstraintContainer container;
+    constraintFunctor(container);
+
+    EXPECT_EQ(container.getConstraints().size(), 6);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 0, 1).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 0, 2).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 0, 3).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 1, 2).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 1, 3).size(), 1);
+    EXPECT_EQ(container.getConstraintsForEdge(3, 2, 3).size(), 1);
 }
 
 ///

@@ -18,12 +18,25 @@ set(copy_data_command
 include(imstkAddExternalProject)
 set(GIT_SHA "4f16f667d53c7cdfaf529adebdf2804e45f5c868")
 set(DATA_URL "https://gitlab.kitware.com/iMSTK/imstk-data/-/archive/${GIT_SHA}/imstk-data-${GIT_SHA}.zip")
+if(DEFINED iMSTK_iMSTKData_ARCHIVE)
+  set(DATA_DOWNLOAD_OPTIONS
+    URL ${iMSTK_iMSTKData_ARCHIVE}
+    )
+  if(DEFINED iMSTK_iMSTKData_ARCHIVE_MD5)
+    list(APPEND DATA_DOWNLOAD_OPTIONS
+      URL_HASH MD5=${iMSTK_iMSTKData_ARCHIVE_MD5}
+      )
+  endif()
+else()
+  set(DATA_DOWNLOAD_OPTIONS
+    URL ${DATA_URL}
+    )
+endif()
 
 imstk_add_external_project( iMSTKData
-  URL ${DATA_URL}
+  ${DATA_DOWNLOAD_OPTIONS}
   CONFIGURE_COMMAND ${SKIP_STEP_COMMAND}
   BUILD_COMMAND ${SKIP_STEP_COMMAND}
   INSTALL_COMMAND COMMAND ${copy_data_command}
   DEPENDENCIES ""
 )
-

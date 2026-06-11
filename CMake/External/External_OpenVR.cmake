@@ -33,22 +33,11 @@ if(CMAKE_PROJECT_NAME STREQUAL "iMSTK")
       ${OpenVR_SOURCE_DIR}/${OpenVR_INC_DIR}
       ${OpenVR_INSTALL_DIR}/include/OpenVR
     )
-  set(copy_openvr_dll_command
-    ${CMAKE_COMMAND} -E copy
-      ${OpenVR_SOURCE_DIR}/${OpenVR_DLL_DIR}/${OpenVR_DLL_NAME}
-      ${OpenVR_INSTALL_DIR}/bin/${OpenVR_DLL_NAME}
-    )
-  set(copy_openvr_lib_command
-    ${CMAKE_COMMAND} -E copy
-      ${OpenVR_SOURCE_DIR}/${OpenVR_LIB_DIR}/${OpenVR_LIB_NAME}
-      ${OpenVR_INSTALL_DIR}/lib/${OpenVR_LIB_NAME}
-    )
 
   set(OpenVR_INSTALL_COMMAND
     INSTALL_COMMAND
+      COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target install --config ${CMAKE_BUILD_TYPE}
       COMMAND ${copy_openvr_headers_command}
-      COMMAND ${copy_openvr_lib_command}
-      COMMAND ${copy_openvr_dll_command}
     )
 else()
   set(OpenVR_INSTALL_COMMAND
@@ -82,10 +71,12 @@ imstk_add_external_project( OpenVR
   DOWNLOAD_DIR ${OpenVR_PREFIX}
   SOURCE_DIR ${OpenVR_SOURCE_DIR}
   UPDATE_COMMAND ${SKIP_STEP_COMMAND}
-  CONFIGURE_COMMAND ${SKIP_STEP_COMMAND}
-  BUILD_COMMAND ${SKIP_STEP_COMMAND}
+  CMAKE_ARGS
+    -DBUILD_SHARED:BOOL=ON
+    -DBUILD_UNIVERSAL:BOOL=OFF
+    -DBUILD_FRAMEWORK:BOOL=OFF
+    -DBUILD_OSX_I386:BOOL=OFF
   ${OpenVR_INSTALL_COMMAND}
   RELATIVE_INCLUDE_PATH "${OpenVR_INC_DIR}"
   #VERBOSE
 )
-

@@ -7,6 +7,10 @@ include(imstkAddExternalProject)
 # Set g3log_SOURCE_DIR and g3log_BINARY_DIR
 imstk_define_external_dirs( g3log )
 
+if(NOT USE_SYSTEM_g3log)
+  unset(g3log_DIR CACHE)
+endif()
+
 #-----------------------------------------------------------------------------
 # Set install commands
 #-----------------------------------------------------------------------------
@@ -27,9 +31,12 @@ else()
   set(g3log_built_library ${CMAKE_COMMAND} -E copy
                           ${g3log_BINARY_DIR}/libg3logger.a
                           ${g3log_INSTALL_DIR}/lib/libg3logger.a)
-  set(g3log_built_shared ${CMAKE_COMMAND} -E copy
-                         ${g3log_BINARY_DIR}/libg3logger.so
-                         ${g3log_INSTALL_DIR}/lib/libg3logger.so)
+  set(g3log_built_shared)
+  if(NOT APPLE)
+    set(g3log_built_shared ${CMAKE_COMMAND} -E copy
+                           ${g3log_BINARY_DIR}/libg3logger.so
+                           ${g3log_INSTALL_DIR}/lib/libg3logger.so)
+  endif()
 endif()
 
 set(g3log_INSTALL_COMMAND
@@ -48,10 +55,21 @@ if(NOT DEFINED iMSTK_g3log_GIT_SHA)
   set(iMSTK_g3log_GIT_SHA "6c1698c4f7db6b9e4246ead38051f9866ea3ac06")
 endif()
 if(NOT DEFINED iMSTK_g3log_GIT_REPOSITORY)
-  set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
-    URL https://gitlab.kitware.com/iMSTK/g3log/-/archive/${iMSTK_g3log_GIT_SHA}/g3log-${iMSTK_g3log_GIT_SHA}.zip
-    URL_HASH MD5=3815bbfec2ff51dc473063c35eec0f36
-    )
+  if(DEFINED iMSTK_g3log_ARCHIVE)
+    set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+      URL ${iMSTK_g3log_ARCHIVE}
+      )
+    if(DEFINED iMSTK_g3log_ARCHIVE_MD5)
+      list(APPEND EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+        URL_HASH MD5=${iMSTK_g3log_ARCHIVE_MD5}
+        )
+    endif()
+  else()
+    set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+      URL https://gitlab.kitware.com/iMSTK/g3log/-/archive/${iMSTK_g3log_GIT_SHA}/g3log-${iMSTK_g3log_GIT_SHA}.zip
+      URL_HASH MD5=3815bbfec2ff51dc473063c35eec0f36
+      )
+  endif()
 else()
   set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
     GIT_REPOSITORY ${iMSTK_g3log_GIT_REPOSITORY}
@@ -68,3 +86,7 @@ imstk_add_external_project( g3log
   DEPENDENCIES ""
   #VERBOSE
 )
+
+if(NOT USE_SYSTEM_g3log)
+  set(g3log_DIR ${g3log_INSTALL_DIR})
+endif()

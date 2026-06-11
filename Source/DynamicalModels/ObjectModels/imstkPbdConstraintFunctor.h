@@ -139,7 +139,7 @@ struct PbdDistanceConstraintFunctor : public PbdBodyConstraintFunctor
                                              E[i1][i2] = 0;
 
                                              auto c = makeDistConstraint(vertices, i1, i2);
-                                             constraints.addConstraint(c);
+                                             constraints.addConstraintForEdge(c, m_bodyIndex, i1, i2);
                                          }
                                      };
 
@@ -286,7 +286,7 @@ struct PbdDistanceConstraintFunctor : public PbdBodyConstraintFunctor
             for (auto& c : distanceSet)
             {
                 auto constraint = makeDistConstraint(initVertices, c.first, c.second);
-                constraints.addConstraint(constraint);
+                constraints.addConstraintForEdge(constraint, m_bodyIndex, c.first, c.second);
             }
         }
 

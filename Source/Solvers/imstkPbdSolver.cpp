@@ -32,32 +32,47 @@ PbdSolver::solve()
 
     double averageC      = 0.0;
     double averageLambda = 0.0;
-    numConstraints += constraints.size();
     // Zero out the Lagrange multiplier
     for (const auto& constraint : constraints)
     {
-        constraint->zeroOutLambda();
+        if (constraint->isActive())
+        {
+            numConstraints++;
+            constraint->zeroOutLambda();
+        }
     }
 
     // Zero out paritioned constraints
     for (const auto& constraintPartition : partitionedConstraints)
     {
-        numConstraints += constraints.size();
         ParallelUtils::parallelFor(constraintPartition.size(),
             [&](const size_t idx)
             {
-                constraintPartition[idx]->zeroOutLambda();
+                if (constraintPartition[idx]->isActive())
+                {
+                    constraintPartition[idx]->zeroOutLambda();
+                }
             });
+        for (const auto& constraint : constraintPartition)
+        {
+            if (constraint->isActive())
+            {
+                numConstraints++;
+            }
+        }
     }
 
     // Zero out insertion/collision constraints
     for (auto constraintList : *m_constraintLists)
     {
         const std::vector<PbdConstraint*>& constraintVec = *constraintList;
-        numConstraints += constraintVec.size();
         for (size_t j = 0; j < constraintVec.size(); j++)
         {
-            constraintVec[j]->zeroOutLambda();
+            if (constraintVec[j]->isActive())
+            {
+                numConstraints++;
+                constraintVec[j]->zeroOutLambda();
+            }
         }
     }
 
@@ -70,14 +85,20 @@ PbdSolver::solve()
             const std::vector<PbdConstraint*>& constraintVec = *constraintList;
             for (size_t j = 0; j < constraintVec.size(); j++)
             {
-                constraintVec[j]->projectConstraint(*m_state, m_dt, m_solverType);
+                if (constraintVec[j]->isActive())
+                {
+                    constraintVec[j]->projectConstraint(*m_state, m_dt, m_solverType);
+                }
             }
         }
 
         // Project all internal body constraints
         for (const auto& constraint : constraints)
         {
-            constraint->projectConstraint(*m_state, m_dt, m_solverType);
+            if (constraint->isActive())
+            {
+                constraint->projectConstraint(*m_state, m_dt, m_solverType);
+            }
         }
 
         for (const auto& constraintPartition : partitionedConstraints)
@@ -85,7 +106,10 @@ PbdSolver::solve()
             ParallelUtils::parallelFor(constraintPartition.size(),
                 [&](const size_t idx)
                 {
-                    constraintPartition[idx]->projectConstraint(*m_state, m_dt, m_solverType);
+                    if (constraintPartition[idx]->isActive())
+                    {
+                        constraintPartition[idx]->projectConstraint(*m_state, m_dt, m_solverType);
+                    }
                 });
             //// Sequential
             //for (size_t k = 0; k < constraintPartition.size(); k++)
@@ -102,16 +126,22 @@ PbdSolver::solve()
 
         for (const auto& constraint : constraints)
         {
-            averageC      += constraint->getConstraintC();
-            averageLambda += constraint->getLambda();
+            if (constraint->isActive())
+            {
+                averageC      += constraint->getConstraintC();
+                averageLambda += constraint->getLambda();
+            }
         }
 
         for (const auto& constraintPartition : partitionedConstraints)
         {
             for (size_t k = 0; k < constraintPartition.size(); k++)
             {
-                averageC      += constraintPartition[k]->getConstraintC();
-                averageLambda += constraintPartition[k]->getLambda();
+                if (constraintPartition[k]->isActive())
+                {
+                    averageC      += constraintPartition[k]->getConstraintC();
+                    averageLambda += constraintPartition[k]->getLambda();
+                }
             }
         }
 
@@ -120,12 +150,15 @@ PbdSolver::solve()
             const std::vector<PbdConstraint*>& constraintVec = *constraintList;
             for (size_t j = 0; j < constraintVec.size(); j++)
             {
-                averageC      += constraintVec[j]->getConstraintC();
-                averageLambda += constraintVec[j]->getLambda();
+                if (constraintVec[j]->isActive())
+                {
+                    averageC      += constraintVec[j]->getConstraintC();
+                    averageLambda += constraintVec[j]->getLambda();
+                }
             }
         }
 
-        averageC /= numConstraints;
+        averageC = (numConstraints > 0) ? averageC / numConstraints : 0.0;
         m_dataTracker->probe(DataTracker::ePhysics::AverageC, averageC);
     }
 }

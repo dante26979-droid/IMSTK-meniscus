@@ -8,6 +8,10 @@
 
 #include "imstkPbdConstraint.h"
 
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace imstk
@@ -27,11 +31,50 @@ public:
     using iterator       = std::vector<std::shared_ptr<PbdConstraint>>::iterator;
     using const_iterator = std::vector<std::shared_ptr<PbdConstraint>>::const_iterator;
 
+    ///
+    /// \brief Unique key for edge constraints within one PBD body
+    ///
+    struct EdgeKey
+    {
+        EdgeKey() = default;
+        EdgeKey(const int bodyId, const int i0, const int i1) :
+            bodyId(bodyId),
+            vertexA(std::min(i0, i1)),
+            vertexB(std::max(i0, i1))
+        {
+        }
+
+        bool operator==(const EdgeKey& other) const
+        {
+            return bodyId == other.bodyId && vertexA == other.vertexA && vertexB == other.vertexB;
+        }
+
+        int bodyId  = -1;
+        int vertexA = -1;
+        int vertexB = -1;
+    };
+
 public:
     ///
     /// \brief Adds a constraint to the system, thread safe
     ///
     virtual void addConstraint(std::shared_ptr<PbdConstraint> constraint);
+
+    ///
+    /// \brief Adds a constraint and indexes it against an edge in a PBD body
+    ///
+    virtual void addConstraintForEdge(std::shared_ptr<PbdConstraint> constraint, int bodyId, int i0, int i1);
+
+    ///
+    /// \brief Gets all constraints indexed against an edge in a PBD body
+    ///
+    virtual std::vector<std::shared_ptr<PbdConstraint>> getConstraintsForEdge(int bodyId, int i0, int i1) const;
+
+    ///
+    /// \brief Deactivates all active constraints indexed against an edge in a PBD body
+    /// \return number of constraints newly deactivated
+    ///
+    virtual size_t deactivateConstraintsForEdge(int bodyId, int i0, int i1);
 
     ///
     /// \brief Linear searches for and removes a constraint from the system, thread safe
@@ -71,7 +114,7 @@ public:
     ///
     /// \brief Get the partitioned constraints
     ///
-    const std::vector<std::vector<std::shared_ptr<PbdConstraint>>> getPartitionedConstraints() const { return m_partitionedConstraints; }
+    const std::vector<std::vector<std::shared_ptr<PbdConstraint>>>& getPartitionedConstraints() const { return m_partitionedConstraints; }
 
     ///
     /// \brief Partitions pbd constraints into separate vectors via graph coloring
@@ -85,8 +128,25 @@ public:
     void clearPartitions() { m_partitionedConstraints.clear(); }
 
 protected:
+    ///
+    /// \brief Removes expired weak references and constraints matching the predicate from the edge map
+    ///
+    void compactEdgeConstraintMap(const std::function<bool(const std::shared_ptr<PbdConstraint>&)>& removeConstraintFunc);
+
+    struct EdgeKeyHash
+    {
+        size_t operator()(const EdgeKey& key) const
+        {
+            size_t seed = static_cast<size_t>(key.bodyId);
+            seed ^= static_cast<size_t>(key.vertexA) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= static_cast<size_t>(key.vertexB) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+
     std::vector<std::shared_ptr<PbdConstraint>> m_constraints;                         ///< Not partitioned constraints
     std::vector<std::vector<std::shared_ptr<PbdConstraint>>> m_partitionedConstraints; ///< Partitioned pbd constraints
-    ParallelUtils::SpinLock m_constraintLock;                                          ///< Used to deal with concurrent addition/removal of constraints
+    std::unordered_map<EdgeKey, std::vector<std::weak_ptr<PbdConstraint>>, EdgeKeyHash> m_edgeConstraints;
+    mutable ParallelUtils::SpinLock m_constraintLock;                                  ///< Used to deal with concurrent addition/removal of constraints
 };
 } // namespace imstk

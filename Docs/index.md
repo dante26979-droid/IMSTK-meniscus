@@ -205,6 +205,8 @@ See more of each model below
 
 * ### [Position Based Dynamics (PBD)](Dynamical_Models/PbdModel.md)
 
+  * [PBD fracture tearing visualization design](PBDFractureTearingDesign.md)
+
 * ### [Smoothed Particle Hydrodynamics (SPH)](Dynamical_Models/SphModel.md)
 
 * ### [Finite Element Method (FEM)](Dynamical_Models/FeDeformableModel.md)

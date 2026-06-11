@@ -5,6 +5,10 @@ if(CMAKE_PROJECT_NAME STREQUAL "iMSTK")
   set(Eigen3_INSTALL_DIR ${CMAKE_INSTALL_PREFIX})
 endif()
 
+if(NOT USE_SYSTEM_Eigen3)
+  unset(Eigen3_DIR CACHE)
+endif()
+
 #-----------------------------------------------------------------------------
 # Add External Project
 #-----------------------------------------------------------------------------
@@ -21,10 +25,21 @@ if(NOT DEFINED iMSTK_Eigen3_GIT_SHA)
   set(iMSTK_Eigen3_GIT_SHA "3.4.0")
 endif()
 if(NOT DEFINED iMSTK_Eigen3_GIT_REPOSITORY)
-  set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
-    URL "https://gitlab.kitware.com/iMSTK/eigen/-/archive/${iMSTK_Eigen3_GIT_SHA}/eigen-${iMSTK_Eigen3_GIT_SHA}.tar.gz"
-    URL_HASH MD5=4c527a9171d71a72a9d4186e65bea559
-    )
+  if(DEFINED iMSTK_Eigen3_ARCHIVE)
+    set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+      URL ${iMSTK_Eigen3_ARCHIVE}
+      )
+    if(DEFINED iMSTK_Eigen3_ARCHIVE_MD5)
+      list(APPEND EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+        URL_HASH MD5=${iMSTK_Eigen3_ARCHIVE_MD5}
+        )
+    endif()
+  else()
+    set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
+      URL "https://gitlab.kitware.com/iMSTK/eigen/-/archive/${iMSTK_Eigen3_GIT_SHA}/eigen-${iMSTK_Eigen3_GIT_SHA}.tar.gz"
+      URL_HASH MD5=4c527a9171d71a72a9d4186e65bea559
+      )
+  endif()
 else()
   set(EXTERNAL_PROJECT_DOWNLOAD_OPTIONS
     GIT_REPOSITORY ${iMSTK_Eigen3_GIT_REPOSITORY}

@@ -103,6 +103,13 @@ public:
     void setCorrectVelocity(const bool correctVelocity) { m_correctVelocity = correctVelocity; }
 
     ///
+    /// \brief Get/Set whether this constraint is active
+    /// Inactive constraints remain in the container but are skipped by the solver.
+    ///
+    bool isActive() const { return m_active; }
+    void setActive(const bool active) { m_active = active; }
+
+    ///
     /// \brief Get gradient given the particle index in constraint
     ///
     const Vec3d& getGradient(const int i) const { return m_dcdx[i]; }
@@ -204,5 +211,6 @@ protected:
     double m_friction        = 0.0;
     double m_restitution     = 0.0;
     bool   m_correctVelocity = false;
+    bool   m_active          = true;
 };
 } // namespace imstk

@@ -21,12 +21,12 @@
 #ifdef WIN32
 #include <vtkWin32HardwareWindow.h>
 #include <vtkWin32RenderWindowInteractor.h>
-#else
-#ifdef iMSTK_USE_VTK_OSMESA
+#elif defined(iMSTK_USE_VTK_OSMESA)
 #include <vtkGenericRenderWindowInteractor.h>
+#elif defined(__APPLE__)
+#include <vtkCocoaRenderWindowInteractor.h>
 #else
 #include <vtkXRenderWindowInteractor.h>
-#endif
 #endif
 
 namespace imstk
@@ -39,13 +39,13 @@ VTKViewer::VTKViewer(std::string name) : AbstractVTKViewer(name)
     // Create the interactor
 #ifdef WIN32
     auto iren = vtkSmartPointer<vtkRenderWindowInteractor>::New();
-#else
-#ifdef iMSTK_USE_VTK_OSMESA
+#elif defined(iMSTK_USE_VTK_OSMESA)
     auto iren = vtkSmartPointer<vtkGenericRenderWindowInteractor>::New();
+#elif defined(__APPLE__)
+    auto iren = vtkSmartPointer<vtkCocoaRenderWindowInteractor>::New();
 #else
     vtkSmartPointer<vtkXRenderWindowInteractor> iren = vtkSmartPointer<vtkXRenderWindowInteractor>::New();
     iren->SetInteractorStyle(m_vtkInteractorStyle.Get());
-#endif
 #endif
     iren->SetInteractorStyle(m_vtkInteractorStyle);
 

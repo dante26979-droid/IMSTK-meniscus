@@ -273,6 +273,18 @@ if(${PROJECT_NAME}_SUPERBUILD)
     imstk_define_dependency(benchmark)
   endif()
 
+  if(USE_SYSTEM_Assimp)
+    mark_as_superbuild(Assimp_ROOT_DIR:PATH)
+  endif()
+  if(USE_SYSTEM_Eigen3)
+    mark_as_superbuild(Eigen3_ROOT_DIR:PATH)
+  endif()
+  if(USE_SYSTEM_g3log)
+    mark_as_superbuild(g3log_ROOT_DIR:PATH)
+  endif()
+  if(USE_SYSTEM_TBB)
+    mark_as_superbuild(TBB_ROOT_DIR:PATH)
+  endif()
 
   #-----------------------------------------------------------------------------
   # Solve project dependencies

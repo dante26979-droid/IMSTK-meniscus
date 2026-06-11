@@ -96,6 +96,11 @@ macro(imstk_add_external_project proj)
         -DCMAKE_INSTALL_PREFIX:PATH=${${proj}_INSTALL_DIR}
         )
     endif()
+    if(DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+      list(APPEND ${proj}_CMAKE_CACHE_ARGS
+        -DCMAKE_POLICY_VERSION_MINIMUM:STRING=${CMAKE_POLICY_VERSION_MINIMUM}
+        )
+    endif()
 
     #-----------------------------------------------------------------------------
     # Add project

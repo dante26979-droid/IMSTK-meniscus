@@ -12,6 +12,11 @@ void
 PbdConstraint::projectConstraint(PbdState& bodies,
                                  const double dt, const SolverType& solverType)
 {
+    if (!m_active)
+    {
+        return;
+    }
+
     if (dt == 0.0)
     {
         return;
@@ -69,7 +74,7 @@ PbdConstraint::projectConstraint(PbdState& bodies,
 void
 PbdConstraint::correctVelocity(PbdState& bodies, const double)
 {
-    if (!m_correctVelocity)
+    if (!m_active || !m_correctVelocity)
     {
         return;
     }

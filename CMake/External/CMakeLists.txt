@@ -79,6 +79,11 @@ if (${PROJECT_NAME}_WRAP_CSHARP)
     -DSWIG_DIR:PATH=${SWIG_DIR}
     -DSWIG_EXECUTABLE:PATH=${SWIG_EXECUTABLE})
 endif()
+if (NOT USE_SYSTEM_g3log)
+  list(APPEND EXTERNAL_PROJECT_OPTIONAL_CMAKE_CACHE_ARGS
+    -Dg3log_ROOT_DIR:PATH=${CMAKE_INSTALL_PREFIX}
+    -Dg3log_LIB_DIR:STRING=lib)
+endif()
 
 #-----------------------------------------------------------------------------
 # Inner build of the main project
@@ -106,4 +111,3 @@ ExternalProject_AlwaysConfigure(${PROJECT_NAME})
 # Add the target to iMSTK folder
 #-----------------------------------------------------------------------------
 set_target_properties(${PROJECT_NAME} PROPERTIES FOLDER iMSTK)
-

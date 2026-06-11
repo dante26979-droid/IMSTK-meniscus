@@ -12,11 +12,108 @@
 namespace imstk
 {
 void
+PbdConstraintContainer::compactEdgeConstraintMap(
+    const std::function<bool(const std::shared_ptr<PbdConstraint>&)>& removeConstraintFunc)
+{
+    for (auto edgeIter = m_edgeConstraints.begin(); edgeIter != m_edgeConstraints.end();)
+    {
+        auto& edgeConstraints = edgeIter->second;
+        edgeConstraints.erase(
+            std::remove_if(edgeConstraints.begin(), edgeConstraints.end(),
+                [&](const std::weak_ptr<PbdConstraint>& weakConstraint)
+                {
+                    std::shared_ptr<PbdConstraint> constraint = weakConstraint.lock();
+                    return constraint == nullptr || removeConstraintFunc(constraint);
+                }),
+            edgeConstraints.end());
+
+        if (edgeConstraints.empty())
+        {
+            edgeIter = m_edgeConstraints.erase(edgeIter);
+        }
+        else
+        {
+            ++edgeIter;
+        }
+    }
+}
+
+void
 PbdConstraintContainer::addConstraint(std::shared_ptr<PbdConstraint> constraint)
 {
     m_constraintLock.lock();
     m_constraints.push_back(constraint);
     m_constraintLock.unlock();
+}
+
+void
+PbdConstraintContainer::addConstraintForEdge(std::shared_ptr<PbdConstraint> constraint, int bodyId, int i0, int i1)
+{
+    m_constraintLock.lock();
+    m_constraints.push_back(constraint);
+    m_edgeConstraints[EdgeKey(bodyId, i0, i1)].push_back(constraint);
+    m_constraintLock.unlock();
+}
+
+std::vector<std::shared_ptr<PbdConstraint>>
+PbdConstraintContainer::getConstraintsForEdge(int bodyId, int i0, int i1) const
+{
+    std::vector<std::shared_ptr<PbdConstraint>> constraints;
+
+    m_constraintLock.lock();
+    const auto it = m_edgeConstraints.find(EdgeKey(bodyId, i0, i1));
+    if (it != m_edgeConstraints.end())
+    {
+        constraints.reserve(it->second.size());
+        for (const std::weak_ptr<PbdConstraint>& weakConstraint : it->second)
+        {
+            if (std::shared_ptr<PbdConstraint> constraint = weakConstraint.lock())
+            {
+                constraints.push_back(constraint);
+            }
+        }
+    }
+    m_constraintLock.unlock();
+
+    return constraints;
+}
+
+size_t
+PbdConstraintContainer::deactivateConstraintsForEdge(int bodyId, int i0, int i1)
+{
+    size_t deactivatedCount = 0;
+
+    m_constraintLock.lock();
+    const auto it = m_edgeConstraints.find(EdgeKey(bodyId, i0, i1));
+    if (it != m_edgeConstraints.end())
+    {
+        auto& edgeConstraints = it->second;
+        edgeConstraints.erase(
+            std::remove_if(edgeConstraints.begin(), edgeConstraints.end(),
+                [&](const std::weak_ptr<PbdConstraint>& weakConstraint)
+                {
+                    std::shared_ptr<PbdConstraint> constraint = weakConstraint.lock();
+                    if (constraint == nullptr)
+                    {
+                        return true;
+                    }
+                    if (constraint->isActive())
+                    {
+                        constraint->setActive(false);
+                        deactivatedCount++;
+                    }
+                    return false;
+                }),
+            edgeConstraints.end());
+
+        if (edgeConstraints.empty())
+        {
+            m_edgeConstraints.erase(it);
+        }
+    }
+    m_constraintLock.unlock();
+
+    return deactivatedCount;
 }
 
 void
@@ -28,6 +125,11 @@ PbdConstraintContainer::removeConstraint(std::shared_ptr<PbdConstraint> constrai
     {
         m_constraints.erase(i);
     }
+    compactEdgeConstraintMap(
+        [&](const std::shared_ptr<PbdConstraint>& edgeConstraint)
+        {
+            return edgeConstraint == constraint;
+        });
     m_constraintLock.unlock();
 }
 
@@ -57,6 +159,8 @@ PbdConstraintContainer::removeConstraints(std::shared_ptr<std::unordered_set<siz
         pc.erase(std::remove_if(pc.begin(), pc.end(), removeConstraintFunc), pc.end());
     }
 
+    compactEdgeConstraintMap(removeConstraintFunc);
+
     m_constraintLock.unlock();
 }
 
@@ -64,7 +168,13 @@ PbdConstraintContainer::iterator
 PbdConstraintContainer::eraseConstraint(iterator iter)
 {
     m_constraintLock.lock();
+    std::shared_ptr<PbdConstraint> constraint = *iter;
     iterator newIter = m_constraints.erase(iter);
+    compactEdgeConstraintMap(
+        [&](const std::shared_ptr<PbdConstraint>& edgeConstraint)
+        {
+            return edgeConstraint == constraint;
+        });
     m_constraintLock.unlock();
     return newIter;
 }
@@ -73,7 +183,13 @@ PbdConstraintContainer::const_iterator
 PbdConstraintContainer::eraseConstraint(const_iterator iter)
 {
     m_constraintLock.lock();
+    std::shared_ptr<PbdConstraint> constraint = *iter;
     const_iterator newIter = m_constraints.erase(iter);
+    compactEdgeConstraintMap(
+        [&](const std::shared_ptr<PbdConstraint>& edgeConstraint)
+        {
+            return edgeConstraint == constraint;
+        });
     m_constraintLock.unlock();
     return newIter;
 }
