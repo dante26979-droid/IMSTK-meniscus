@@ -43,7 +43,7 @@ if (NOT DEFINED iMSTK_USE_RENDERING_VTK OR iMSTK_USE_RENDERING_VTK)
 
   target_compile_definitions(${PROJECT_NAME}
     PRIVATE
-      IMPORTED_MENISCUS_VTK_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../banyueban_left_withCut_Cut2.vtk"
+      IMPORTED_MENISCUS_VTK_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../banyueban_left_withCut_Cut2_sim.vtk"
       DEMO_IMSTK_DATA_ROOT="${iMSTK_DATA_DIR}")
 
   if (iMSTK_USE_HAPTICS)

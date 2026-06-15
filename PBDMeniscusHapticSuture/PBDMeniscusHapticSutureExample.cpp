@@ -7,15 +7,12 @@
 #include "imstkCamera.h"
 #include "imstkCapsule.h"
 #include "imstkDirectionalLight.h"
-#include "imstkDummyClient.h"
 #include "imstkGeometryUtilities.h"
 #include "imstkIsometricMap.h"
 #include "imstkKeyboardDeviceClient.h"
 #include "imstkKeyboardSceneControl.h"
 #include "imstkLineMesh.h"
 #include "imstkMeshIO.h"
-#include "imstkMouseDeviceClient.h"
-#include "imstkMouseSceneControl.h"
 #include "imstkNew.h"
 #include "imstkPbdContactConstraint.h"
 #include "imstkPbdBaryPointToPointConstraint.h"
@@ -28,7 +25,6 @@
 #include "imstkPbdObjectController.h"
 #include "imstkPbdObjectGrasping.h"
 #include "imstkPbdSolver.h"
-#include "imstkPlane.h"
 #include "imstkRenderMaterial.h"
 #include "imstkScene.h"
 #include "imstkSceneManager.h"
@@ -72,12 +68,15 @@ static constexpr bool SHOW_MENISCUS_EDGE_OVERLAY = false;
 static constexpr double PBD_TIME_STEP = 1.0 / 60.0;
 static constexpr double DRIVER_TIME_STEP = 1.0 / 60.0;
 static constexpr int PBD_SOLVER_ITERATIONS = 4;
-static constexpr double MENISCUS_EDGE_STIFFNESS = 5.0e4;
-static constexpr double LAP_TOOL_SCALE = 4.0;
-static constexpr double NEEDLE_SCALE = 25.0;
+static constexpr double MENISCUS_EDGE_STIFFNESS = 8.0e5;
+static constexpr double LAP_TOOL_SCALE = 20.0;
+static constexpr double NEEDLE_SCALE = 50.0;
+static constexpr double NEEDLE_CURVE_GAIN = 1.35;
 static constexpr double GRASP_CAPSULE_RADIUS = 0.05;
 static constexpr double GRASP_CAPSULE_LENGTH = 0.18;
 static constexpr double MANUAL_NEEDLE_GRASP_TOLERANCE = 0.08;
+static constexpr int HAPTIC_BUTTON_COUNT = 4;
+static constexpr int HAPTIC_BUTTON_ARM_RELEASE_FRAMES = 10;
 static constexpr bool ENABLE_AUTO_SUTURE_ANCHORS = true;
 static constexpr int MAX_SUTURE_ANCHORS = 8;
 static constexpr double PUNCTURE_SURFACE_DISTANCE = 0.18;
@@ -134,6 +133,48 @@ buildEdgeCells(const std::vector<Edge>& edges)
         indices->push_back(Vec2i(edge[0], edge[1]));
     }
     return indices;
+}
+
+static void
+increaseNeedleCurvature(const std::shared_ptr<VecDataArray<double, 3>> vertices)
+{
+    if (vertices == nullptr || vertices->size() < 3)
+    {
+        return;
+    }
+
+    int minZIndex = 0;
+    int maxZIndex = 0;
+    for (int i = 1; i < vertices->size(); i++)
+    {
+        if ((*vertices)[i].z() < (*vertices)[minZIndex].z())
+        {
+            minZIndex = i;
+        }
+        if ((*vertices)[i].z() > (*vertices)[maxZIndex].z())
+        {
+            maxZIndex = i;
+        }
+    }
+
+    const double minZ = (*vertices)[minZIndex].z();
+    const double maxZ = (*vertices)[maxZIndex].z();
+    const double zSpan = maxZ - minZ;
+    if (zSpan < 1.0e-8)
+    {
+        return;
+    }
+
+    const double minY = (*vertices)[minZIndex].y();
+    const double maxY = (*vertices)[maxZIndex].y();
+    for (int i = 0; i < vertices->size(); i++)
+    {
+        Vec3d& p = (*vertices)[i];
+        const double t = (p.z() - minZ) / zSpan;
+        const double chordY = minY + t * (maxY - minY);
+        p.y() = chordY + (p.y() - chordY) * NEEDLE_CURVE_GAIN;
+    }
+    vertices->postModified();
 }
 
 static std::shared_ptr<VecDataArray<int, 3>>
@@ -568,6 +609,10 @@ makeNeedleObj(const std::shared_ptr<PbdModel> model, const Vec3d& initPos)
         needleLineMesh->translate(Vec3d(0.0, -0.0047, -0.0087), Geometry::TransformType::ApplyToData);
         needleMesh->scale(NEEDLE_SCALE, Geometry::TransformType::ApplyToData);
         needleLineMesh->scale(NEEDLE_SCALE, Geometry::TransformType::ApplyToData);
+        increaseNeedleCurvature(needleMesh->getVertexPositions());
+        increaseNeedleCurvature(needleLineMesh->getVertexPositions());
+        needleMesh->postModified();
+        needleLineMesh->postModified();
         needleObj->setVisualGeometry(needleMesh);
         needleObj->setPhysicsToVisualMap(std::make_shared<IsometricMap>(needleLineMesh, needleMesh));
         needleObj->getVisualModel(0)->getRenderMaterial()->setColor(Color::Orange);
@@ -690,15 +735,11 @@ main()
     }
 
     const Vec3d tissueCenter = (meniscusTissue.boundsMin + meniscusTissue.boundsMax) * 0.5;
-    const Vec3d hapticWorkspaceOffset = tissueCenter + Vec3d(0.0, 1.9, 1.0);
-    const Vec3d leftToolStart = hapticWorkspaceOffset + Vec3d(0.0, 0.0, 0.15 * LAP_TOOL_SCALE);
-    const Vec3d rightToolStart = tissueCenter + Vec3d(1.2, 1.25, 1.2);
+    const Vec3d hapticWorkspaceOffset = tissueCenter + Vec3d(0.0, 1.2, 0.2);
+    const Vec3d leftToolStart = hapticWorkspaceOffset + Vec3d(0.0, 0.0, 0.6);
     std::shared_ptr<PbdObject> leftToolObj =
         makeLapToolObj("leftHapticLapTool", pbdModel, leftToolStart);
     scene->addSceneObject(leftToolObj);
-    std::shared_ptr<PbdObject> rightToolObj =
-        makeLapToolObj("rightMouseLapTool", pbdModel, rightToolStart);
-    scene->addSceneObject(rightToolObj);
 
     std::shared_ptr<PbdObject> needleObj =
         makeNeedleObj(pbdModel, tissueCenter + Vec3d(0.25, 0.8, 0.8));
@@ -708,14 +749,10 @@ main()
         "sutureThread",
         tissueCenter + Vec3d(0.25, 0.8, 0.8),
         Vec3d(0.0, 0.0, 1.0),
-        50,
-        2.2,
+        80,
+        3.7,
         needleObj);
     scene->addSceneObject(sutureThreadObj);
-
-    auto toolCollision = std::make_shared<PbdObjectCollision>(leftToolObj, rightToolObj);
-    toolCollision->setRigidBodyCompliance(0.00001);
-    scene->addInteraction(toolCollision);
 
     if (ENABLE_TOOL_NEEDLE_CONTACT)
     {
@@ -723,10 +760,6 @@ main()
         leftNeedleCollision->setRigidBodyCompliance(0.0001);
         leftNeedleCollision->setUseCorrectVelocity(false);
         scene->addInteraction(leftNeedleCollision);
-        auto rightNeedleCollision = std::make_shared<PbdObjectCollision>(rightToolObj, needleObj);
-        rightNeedleCollision->setRigidBodyCompliance(0.0001);
-        rightNeedleCollision->setUseCorrectVelocity(false);
-        scene->addInteraction(rightNeedleCollision);
     }
 
     if (ENABLE_TOOL_THREAD_CONTACT)
@@ -735,10 +768,6 @@ main()
         leftThreadCollision->setRigidBodyCompliance(0.0001);
         leftThreadCollision->setUseCorrectVelocity(false);
         scene->addInteraction(leftThreadCollision);
-        auto rightThreadCollision = std::make_shared<PbdObjectCollision>(rightToolObj, sutureThreadObj);
-        rightThreadCollision->setRigidBodyCompliance(0.0001);
-        rightThreadCollision->setUseCorrectVelocity(false);
-        scene->addInteraction(rightThreadCollision);
     }
 
     if (ENABLE_NEEDLE_TISSUE_CONTACT)
@@ -763,12 +792,6 @@ main()
     auto leftThreadGrasping = std::make_shared<PbdObjectGrasping>(sutureThreadObj, leftToolObj);
     leftThreadGrasping->setCompliance(0.00001);
     scene->addInteraction(leftThreadGrasping);
-    auto rightNeedleGrasping = std::make_shared<PbdObjectGrasping>(needleObj, rightToolObj);
-    rightNeedleGrasping->setCompliance(0.00001);
-    scene->addInteraction(rightNeedleGrasping);
-    auto rightThreadGrasping = std::make_shared<PbdObjectGrasping>(sutureThreadObj, rightToolObj);
-    rightThreadGrasping->setCompliance(0.00001);
-    scene->addInteraction(rightThreadGrasping);
 
     auto nearestPointOnSegment = [](const Vec3d& p, const Vec3d& a, const Vec3d& b) -> Vec3d
         {
@@ -793,9 +816,7 @@ main()
         };
 
     std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>> leftManualNeedleConstraints;
-    std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>> rightManualNeedleConstraints;
     std::vector<PbdConstraint*> leftManualNeedleConstraintPtrs;
-    std::vector<PbdConstraint*> rightManualNeedleConstraintPtrs;
 
     auto clearManualNeedleGrasp =
         [](std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>>& constraints,
@@ -951,11 +972,6 @@ main()
         scene->addInteraction(threadSelfCollision);
     }
 
-    auto mousePlane = std::make_shared<Plane>(
-        tissueCenter + Vec3d(0.0, 1.2, 1.4),
-        Vec3d(0.1, 0.0, 1.0));
-    mousePlane->setWidth(6.0);
-
     imstkNew<DirectionalLight> light;
     light->setFocalPoint(Vec3d(-1.0, -1.0, -1.0));
     light->setIntensity(1.0);
@@ -975,8 +991,11 @@ main()
     driver->setDesiredDt(DRIVER_TIME_STEP);
 
     bool leftGraspActive = false;
-    bool rightGraspActive = false;
-    double rightDummyOffset = -0.07 * LAP_TOOL_SCALE;
+    bool hapticButtonsArmed = false;
+    int hapticButtonReleasedFrames = 0;
+    int hapticActiveButton = -1;
+    int hapticLastButton = -1;
+    int hapticLastButtonState = 0;
 
 #ifdef iMSTK_USE_HAPTICS
     std::shared_ptr<DeviceManager> hapticManager = DeviceManagerFactory::makeDeviceManager();
@@ -1004,13 +1023,29 @@ main()
     connect<ButtonEvent>(leftDeviceClient, &DeviceClient::buttonStateChanged,
         [&](ButtonEvent* e)
         {
-            if (e->m_button != 0 && e->m_button != 1)
+            std::cout << "PBDMeniscusHapticSuture: haptic button event id="
+                      << e->m_button << " state=" << e->m_buttonState << std::endl;
+
+            if (e->m_button < 0 || e->m_button >= HAPTIC_BUTTON_COUNT)
             {
                 return;
             }
+            hapticLastButton = e->m_button;
+            hapticLastButtonState = e->m_buttonState;
 
             if (e->m_buttonState == BUTTON_PRESSED)
             {
+                if (!hapticButtonsArmed)
+                {
+                    std::cout << "PBDMeniscusHapticSuture: ignored initial haptic button "
+                              << e->m_button << " pressed before release-arm." << std::endl;
+                    return;
+                }
+                if (leftGraspActive)
+                {
+                    return;
+                }
+
                 auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
                     leftToolObj->getVisualModel(1)->getGeometry());
                 tryBeginManualNeedleGrasp(
@@ -1020,26 +1055,55 @@ main()
                     leftManualNeedleConstraintPtrs);
                 leftThreadGrasping->beginCellGrasp(graspCapsule);
                 leftGraspActive = true;
+                hapticActiveButton = e->m_button;
                 std::cout << "PBDMeniscusHapticSuture: left haptic grasp button "
                           << e->m_button << " pressed." << std::endl;
             }
             else if (e->m_buttonState == BUTTON_RELEASED)
             {
+                if (hapticActiveButton != -1 && e->m_button != hapticActiveButton)
+                {
+                    return;
+                }
                 clearManualNeedleGrasp(leftManualNeedleConstraints, leftManualNeedleConstraintPtrs);
                 leftThreadGrasping->endGrasp();
                 leftGraspActive = false;
+                hapticActiveButton = -1;
                 std::cout << "PBDMeniscusHapticSuture: left haptic grasp button "
                           << e->m_button << " released." << std::endl;
             }
         });
+
+    connect<Event>(sceneManager, &SceneManager::postUpdate,
+        [&](Event*)
+        {
+            if (hapticButtonsArmed)
+            {
+                return;
+            }
+
+            bool buttonsReleased = true;
+            for (int buttonId = 0; buttonId < HAPTIC_BUTTON_COUNT; buttonId++)
+            {
+                if (leftDeviceClient->getButton(buttonId) == BUTTON_PRESSED)
+                {
+                    buttonsReleased = false;
+                    hapticLastButton = buttonId;
+                    hapticLastButtonState = BUTTON_PRESSED;
+                    break;
+                }
+            }
+            hapticButtonReleasedFrames = buttonsReleased ? hapticButtonReleasedFrames + 1 : 0;
+            if (hapticButtonReleasedFrames >= HAPTIC_BUTTON_ARM_RELEASE_FRAMES)
+            {
+                hapticButtonsArmed = true;
+                std::cout << "PBDMeniscusHapticSuture: haptic grasp buttons armed after startup release." << std::endl;
+            }
+        });
 #else
+    hapticButtonsArmed = true;
     std::cout << "PBDMeniscusHapticSuture: haptics are not compiled; the left tool is stationary." << std::endl;
 #endif
-
-    auto rightDeviceClient = std::make_shared<DummyClient>();
-    auto rightController = rightToolObj->getComponent<PbdObjectController>();
-    rightController->setDevice(rightDeviceClient);
-    rightController->setUseSpring(false);
 
     double latestSceneDt = driver->getDesiredDt();
 
@@ -1050,7 +1114,7 @@ main()
     diagnosticsText->setPosition(TextVisualModel::DisplayPosition::LowerLeft);
     diagnosticsText->setFontSize(24.0);
     diagnosticsText->setTextColor(Color::White);
-    diagnosticsText->setText("FPS: -- | sim dt: -- ms | anchors: -- | btn: -- | LN/LT/RN/RT: --");
+    diagnosticsText->setText("FPS: -- | sim dt: -- ms | anchors: -- | arm: -- | raw: -- | active: -- | btn: -- | LN/LT: --");
 
     double visualDtAccum = 0.0;
     int visualFrameCount = 0;
@@ -1070,12 +1134,13 @@ main()
                    << "FPS: " << visualFps
                    << " | sim dt: " << latestSceneDt * 1000.0 << " ms"
                    << " | anchors: " << sutureAnchorConstraints.size()
-                   << " | btn: " << (leftGraspActive ? "L" : "-") << (rightGraspActive ? "R" : "-")
-                   << " | LN/LT/RN/RT: "
+                   << " | arm: " << (hapticButtonsArmed ? "1" : "0")
+                   << " | raw: " << hapticLastButton << "/" << hapticLastButtonState
+                   << " | active: " << hapticActiveButton
+                   << " | btn: " << (leftGraspActive ? "L" : "-")
+                   << " | LN/LT: "
                    << (!leftManualNeedleConstraints.empty() ? "1" : "0")
-                   << (leftThreadGrasping->hasConstraints() ? "1" : "0")
-                   << (!rightManualNeedleConstraints.empty() ? "1" : "0")
-                   << (rightThreadGrasping->hasConstraints() ? "1" : "0");
+                   << (leftThreadGrasping->hasConstraints() ? "1" : "0");
             diagnosticsText->setText(stream.str());
 
             visualDtAccum = 0.0;
@@ -1092,21 +1157,6 @@ main()
     connect<Event>(sceneManager, &SceneManager::postUpdate,
         [&](Event*)
         {
-            std::shared_ptr<MouseDeviceClient> mouseDeviceClient = viewer->getMouseDevice();
-            const Vec2d& mousePos = mouseDeviceClient->getPos();
-            auto geom = std::dynamic_pointer_cast<Capsule>(rightToolObj->getPhysicsGeometry());
-            Vec3d a = Vec3d::UnitY();
-            Vec3d b = a.cross(mousePlane->getNormal()).normalized();
-            a = b.cross(mousePlane->getNormal());
-            const double width = mousePlane->getWidth();
-            const Vec3d toolAxis =
-                (geom != nullptr) ? geom->getOrientation().toRotationMatrix().col(1).normalized() : Vec3d::UnitY();
-            rightDeviceClient->setPosition(
-                mousePlane->getPosition()
-                + a * width * (mousePos[1] - 0.5)
-                + b * width * (mousePos[0] - 0.5)
-                + toolAxis * rightDummyOffset);
-
             if (ENABLE_AUTO_SUTURE_ANCHORS)
             {
                 if (anchorCooldownFrames > 0)
@@ -1151,26 +1201,10 @@ main()
                 }
                 leftThreadGrasping->regrasp();
             }
-            if (rightGraspActive)
-            {
-                if (rightManualNeedleConstraints.empty())
-                {
-                    tryBeginManualNeedleGrasp(
-                        "right mouse",
-                        rightToolObj,
-                        rightManualNeedleConstraints,
-                        rightManualNeedleConstraintPtrs);
-                }
-                rightThreadGrasping->regrasp();
-            }
 
             if (!leftManualNeedleConstraintPtrs.empty())
             {
                 pbdModel->getSolver()->addConstraints(&leftManualNeedleConstraintPtrs);
-            }
-            if (!rightManualNeedleConstraintPtrs.empty())
-            {
-                pbdModel->getSolver()->addConstraints(&rightManualNeedleConstraintPtrs);
             }
 
             if (ENABLE_MENISCUS_DEFORMATION)
@@ -1212,38 +1246,12 @@ main()
             }
         });
 
-    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseScroll,
-        [&](MouseEvent* e)
-        {
-            rightDummyOffset += e->m_scrollDx * 0.01;
-        });
-    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseButtonPress,
-        [&](MouseEvent*)
-        {
-            auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
-                rightToolObj->getVisualModel(1)->getGeometry());
-            tryBeginManualNeedleGrasp(
-                "right mouse",
-                rightToolObj,
-                rightManualNeedleConstraints,
-                rightManualNeedleConstraintPtrs);
-            rightThreadGrasping->beginCellGrasp(graspCapsule);
-            rightGraspActive = true;
-        });
-    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseButtonRelease,
-        [&](MouseEvent*)
-        {
-            clearManualNeedleGrasp(rightManualNeedleConstraints, rightManualNeedleConstraintPtrs);
-            rightThreadGrasping->endGrasp();
-            rightGraspActive = false;
-        });
-
     std::cout << "PBDMeniscusHapticSuture: imported tetrahedral VTK mesh is ready." << std::endl;
     std::cout << "PBDMeniscusHapticSuture: single haptic device controls the left lap tool." << std::endl;
     std::cout << "PBDMeniscusHapticSuture: haptic force feedback is "
               << (ENABLE_HAPTIC_FORCE_FEEDBACK ? "enabled." : "disabled for initial testing.") << std::endl;
-    std::cout << "PBDMeniscusHapticSuture: hold haptic button 0/1 to grasp the needle or thread; release to let go." << std::endl;
-    std::cout << "PBDMeniscusHapticSuture: the right lap tool is mouse controlled; mouse press grasps, release lets go, scroll changes depth." << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: hold the TouchX haptic button to grasp the needle or thread; release to let go." << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: mouse-controlled tool is disabled; mouse input only affects the viewer controls." << std::endl;
 
     driver->start();
     return 0;
