@@ -817,6 +817,9 @@ main()
 
     std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>> leftManualNeedleConstraints;
     std::vector<PbdConstraint*> leftManualNeedleConstraintPtrs;
+    bool needleRigidFollowActive = false;
+    Vec3d needleRigidFollowLocalPosition = Vec3d::Zero();
+    Quatd needleRigidFollowLocalOrientation = Quatd::Identity();
 
     auto clearManualNeedleGrasp =
         [](std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>>& constraints,
@@ -824,6 +827,53 @@ main()
         {
             constraints.clear();
             constraintPtrs.clear();
+        };
+
+    auto beginNeedleRigidFollow =
+        [&](const std::shared_ptr<PbdObject> toolObj)
+        {
+            const auto toolBody = toolObj->getPbdBody();
+            const auto needleBody = needleObj->getPbdBody();
+            const Vec3d toolPos = toolBody->getRigidPosition();
+            const Quatd toolOrientation = toolBody->getRigidOrientation();
+            const Vec3d needlePos = needleBody->getRigidPosition();
+            const Quatd needleOrientation = needleBody->getRigidOrientation();
+
+            needleRigidFollowLocalPosition =
+                toolOrientation.inverse()._transformVector(needlePos - toolPos);
+            needleRigidFollowLocalOrientation =
+                toolOrientation.inverse() * needleOrientation;
+            needleRigidFollowActive = true;
+        };
+
+    auto endNeedleRigidFollow =
+        [&]()
+        {
+            needleRigidFollowActive = false;
+        };
+
+    auto syncNeedleRigidFollow =
+        [&](const std::shared_ptr<PbdObject> toolObj)
+        {
+            if (!needleRigidFollowActive)
+            {
+                return;
+            }
+
+            const auto toolBody = toolObj->getPbdBody();
+            const auto needleBody = needleObj->getPbdBody();
+            const Vec3d toolPos = toolBody->getRigidPosition();
+            const Quatd toolOrientation = toolBody->getRigidOrientation();
+            const Vec3d targetPos =
+                toolPos + toolOrientation._transformVector(needleRigidFollowLocalPosition);
+            const Quatd targetOrientation =
+                toolOrientation * needleRigidFollowLocalOrientation;
+
+            needleBody->overrideRigidPositionAndOrientation(targetPos, targetOrientation);
+            if (needleBody->velocities != nullptr && needleBody->angularVelocities != nullptr)
+            {
+                needleBody->overrideLinearAndAngularVelocity(Vec3d::Zero(), Vec3d::Zero());
+            }
         };
 
     auto tryBeginManualNeedleGrasp =
@@ -1048,11 +1098,15 @@ main()
 
                 auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
                     leftToolObj->getVisualModel(1)->getGeometry());
-                tryBeginManualNeedleGrasp(
+                const bool beganNeedleGrasp = tryBeginManualNeedleGrasp(
                     "left haptic",
                     leftToolObj,
                     leftManualNeedleConstraints,
                     leftManualNeedleConstraintPtrs);
+                if (beganNeedleGrasp)
+                {
+                    beginNeedleRigidFollow(leftToolObj);
+                }
                 leftThreadGrasping->beginCellGrasp(graspCapsule);
                 leftGraspActive = true;
                 hapticActiveButton = e->m_button;
@@ -1066,6 +1120,7 @@ main()
                     return;
                 }
                 clearManualNeedleGrasp(leftManualNeedleConstraints, leftManualNeedleConstraintPtrs);
+                endNeedleRigidFollow();
                 leftThreadGrasping->endGrasp();
                 leftGraspActive = false;
                 hapticActiveButton = -1;
@@ -1157,6 +1212,8 @@ main()
     connect<Event>(sceneManager, &SceneManager::postUpdate,
         [&](Event*)
         {
+            syncNeedleRigidFollow(leftToolObj);
+
             if (ENABLE_AUTO_SUTURE_ANCHORS)
             {
                 if (anchorCooldownFrames > 0)
@@ -1193,11 +1250,19 @@ main()
             {
                 if (leftManualNeedleConstraints.empty())
                 {
-                    tryBeginManualNeedleGrasp(
+                    const bool beganNeedleGrasp = tryBeginManualNeedleGrasp(
                         "left haptic",
                         leftToolObj,
                         leftManualNeedleConstraints,
                         leftManualNeedleConstraintPtrs);
+                    if (beganNeedleGrasp)
+                    {
+                        beginNeedleRigidFollow(leftToolObj);
+                    }
+                }
+                else if (!needleRigidFollowActive)
+                {
+                    beginNeedleRigidFollow(leftToolObj);
                 }
                 leftThreadGrasping->regrasp();
             }
@@ -1229,11 +1294,15 @@ main()
             {
                 auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
                     leftToolObj->getVisualModel(1)->getGeometry());
-                tryBeginManualNeedleGrasp(
+                const bool beganNeedleGrasp = tryBeginManualNeedleGrasp(
                     "left keyboard",
                     leftToolObj,
                     leftManualNeedleConstraints,
                     leftManualNeedleConstraintPtrs);
+                if (beganNeedleGrasp)
+                {
+                    beginNeedleRigidFollow(leftToolObj);
+                }
                 leftThreadGrasping->beginCellGrasp(graspCapsule);
                 leftGraspActive = true;
                 return;
@@ -1241,6 +1310,7 @@ main()
             if (e->m_key == 'f')
             {
                 clearManualNeedleGrasp(leftManualNeedleConstraints, leftManualNeedleConstraintPtrs);
+                endNeedleRigidFollow();
                 leftThreadGrasping->endGrasp();
                 leftGraspActive = false;
             }
