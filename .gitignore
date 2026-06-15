@@ -1,3 +1,24 @@
 *.swp
 Docs/source/_build/
 Docs/source/.vscode/settings.json
+
+# Local build and dependency outputs
+build/
+install/
+**/build/
+**/build-*/
+**/build_*/
+
+# Visual Studio and CMake generated files
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Runtime logs and packaged scratch files
+*.log
+*.zip
