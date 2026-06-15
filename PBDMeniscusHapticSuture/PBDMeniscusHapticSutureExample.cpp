@@ -5,8 +5,10 @@
 */
 
 #include "imstkCamera.h"
+#include "imstkCapsule.h"
 #include "imstkDirectionalLight.h"
 #include "imstkDummyClient.h"
+#include "imstkGeometryUtilities.h"
 #include "imstkIsometricMap.h"
 #include "imstkKeyboardDeviceClient.h"
 #include "imstkKeyboardSceneControl.h"
@@ -15,17 +17,19 @@
 #include "imstkMouseDeviceClient.h"
 #include "imstkMouseSceneControl.h"
 #include "imstkNew.h"
+#include "imstkPbdContactConstraint.h"
+#include "imstkPbdBaryPointToPointConstraint.h"
 #include "imstkPbdConstraintContainer.h"
 #include "imstkPbdDistanceConstraint.h"
 #include "imstkPbdModel.h"
 #include "imstkPbdModelConfig.h"
 #include "imstkPbdObject.h"
-#include "imstkPbdObjectStitching.h"
-#include "imstkRbdConstraint.h"
+#include "imstkPbdObjectCollision.h"
+#include "imstkPbdObjectController.h"
+#include "imstkPbdObjectGrasping.h"
+#include "imstkPbdSolver.h"
+#include "imstkPlane.h"
 #include "imstkRenderMaterial.h"
-#include "imstkRigidBodyModel2.h"
-#include "imstkRigidObject2.h"
-#include "imstkRigidObjectController.h"
 #include "imstkScene.h"
 #include "imstkSceneManager.h"
 #include "imstkSimulationManager.h"
@@ -45,6 +49,7 @@
 #include <array>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -54,6 +59,29 @@ using namespace imstk;
 
 using Edge = std::array<int, 2>;
 using Face = std::array<int, 3>;
+
+static constexpr bool ENABLE_HAPTIC_FORCE_FEEDBACK = false;
+static constexpr double HAPTIC_TRANSLATION_SCALING = 35.0;
+static constexpr bool ENABLE_NEEDLE_TISSUE_CONTACT = true;
+static constexpr bool ENABLE_THREAD_TISSUE_CONTACT = true;
+static constexpr bool ENABLE_TOOL_NEEDLE_CONTACT = false;
+static constexpr bool ENABLE_TOOL_THREAD_CONTACT = true;
+static constexpr bool ENABLE_THREAD_SELF_COLLISION = false;
+static constexpr bool ENABLE_MENISCUS_DEFORMATION = true;
+static constexpr bool SHOW_MENISCUS_EDGE_OVERLAY = false;
+static constexpr double PBD_TIME_STEP = 1.0 / 60.0;
+static constexpr double DRIVER_TIME_STEP = 1.0 / 60.0;
+static constexpr int PBD_SOLVER_ITERATIONS = 4;
+static constexpr double MENISCUS_EDGE_STIFFNESS = 5.0e4;
+static constexpr double LAP_TOOL_SCALE = 4.0;
+static constexpr double NEEDLE_SCALE = 25.0;
+static constexpr double GRASP_CAPSULE_RADIUS = 0.05;
+static constexpr double GRASP_CAPSULE_LENGTH = 0.18;
+static constexpr double MANUAL_NEEDLE_GRASP_TOLERANCE = 0.08;
+static constexpr bool ENABLE_AUTO_SUTURE_ANCHORS = true;
+static constexpr int MAX_SUTURE_ANCHORS = 8;
+static constexpr double PUNCTURE_SURFACE_DISTANCE = 0.18;
+static constexpr double PUNCTURE_SIGN_EPSILON = 0.005;
 
 struct MeniscusTissue
 {
@@ -118,19 +146,32 @@ buildBoundarySurfaceCells(const std::shared_ptr<TetrahedralMesh> tetMesh)
     };
 
     std::map<Face, FaceEntry> faces;
+    const VecDataArray<double, 3>& vertices = *tetMesh->getVertexPositions();
     const VecDataArray<int, 4>& tets = *tetMesh->getCells();
-    const std::array<Vec3i, 4> facePattern = {
-        Vec3i(0, 1, 2), Vec3i(0, 1, 3), Vec3i(0, 2, 3), Vec3i(1, 2, 3)
+    const std::array<Vec4i, 4> facePattern = {
+        Vec4i(0, 1, 2, 3),
+        Vec4i(0, 3, 1, 2),
+        Vec4i(0, 2, 3, 1),
+        Vec4i(1, 3, 2, 0)
     };
 
     for (int i = 0; i < tets.size(); i++)
     {
         const Vec4i& tet = tets[i];
-        for (const Vec3i& pattern : facePattern)
+        for (const Vec4i& pattern : facePattern)
         {
             const Vec3i face(tet[pattern[0]], tet[pattern[1]], tet[pattern[2]]);
+            const int oppositeVertex = tet[pattern[3]];
+            const Vec3d& p0 = vertices[face[0]];
+            const Vec3d& p1 = vertices[face[1]];
+            const Vec3d& p2 = vertices[face[2]];
+            const Vec3d& p3 = vertices[oppositeVertex];
+            const Vec3d normal = (p1 - p0).cross(p2 - p0);
+            const Vec3d outward = ((p0 + p1 + p2) / 3.0) - p3;
+            const Vec3i outwardFace =
+                (normal.dot(outward) >= 0.0) ? face : Vec3i(face[0], face[2], face[1]);
             FaceEntry& entry = faces[makeFaceKey(face[0], face[1], face[2])];
-            entry.face = face;
+            entry.face = outwardFace;
             entry.count++;
         }
     }
@@ -151,7 +192,136 @@ makeBoundarySurfaceMesh(const std::shared_ptr<TetrahedralMesh> tetMesh)
 {
     auto surfaceMesh = std::make_shared<SurfaceMesh>();
     surfaceMesh->initialize(tetMesh->getVertexPositions(), buildBoundarySurfaceCells(tetMesh));
+    surfaceMesh->computeVertexNormals();
     return surfaceMesh;
+}
+
+static Vec3d
+closestPointOnTriangle(const Vec3d& p, const Vec3d& a, const Vec3d& b, const Vec3d& c)
+{
+    const Vec3d ab = b - a;
+    const Vec3d ac = c - a;
+    const Vec3d ap = p - a;
+    const double d1 = ab.dot(ap);
+    const double d2 = ac.dot(ap);
+    if (d1 <= 0.0 && d2 <= 0.0)
+    {
+        return a;
+    }
+
+    const Vec3d bp = p - b;
+    const double d3 = ab.dot(bp);
+    const double d4 = ac.dot(bp);
+    if (d3 >= 0.0 && d4 <= d3)
+    {
+        return b;
+    }
+
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    {
+        return a + (d1 / (d1 - d3)) * ab;
+    }
+
+    const Vec3d cp = p - c;
+    const double d5 = ab.dot(cp);
+    const double d6 = ac.dot(cp);
+    if (d6 >= 0.0 && d5 <= d6)
+    {
+        return c;
+    }
+
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    {
+        return a + (d2 / (d2 - d6)) * ac;
+    }
+
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    {
+        return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b);
+    }
+
+    const double denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+static Vec3d
+computeTriangleBarycentric(const Vec3d& p, const Vec3d& a, const Vec3d& b, const Vec3d& c)
+{
+    const Vec3d v0 = b - a;
+    const Vec3d v1 = c - a;
+    const Vec3d v2 = p - a;
+    const double d00 = v0.dot(v0);
+    const double d01 = v0.dot(v1);
+    const double d11 = v1.dot(v1);
+    const double d20 = v2.dot(v0);
+    const double d21 = v2.dot(v1);
+    const double denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) < 1.0e-12)
+    {
+        return Vec3d(1.0, 0.0, 0.0);
+    }
+    const double v = (d11 * d20 - d01 * d21) / denom;
+    const double w = (d00 * d21 - d01 * d20) / denom;
+    return Vec3d(1.0 - v - w, v, w);
+}
+
+struct SurfaceHit
+{
+    bool valid = false;
+    int triangleId = -1;
+    Vec3i triangle = Vec3i::Zero();
+    Vec3d point = Vec3d::Zero();
+    Vec3d barycentric = Vec3d(1.0, 0.0, 0.0);
+    double distance = std::numeric_limits<double>::max();
+    double signedDistance = 0.0;
+};
+
+static SurfaceHit
+findClosestSurfaceHit(const std::shared_ptr<SurfaceMesh> surfaceMesh, const Vec3d& p)
+{
+    SurfaceHit hit;
+    if (surfaceMesh == nullptr)
+    {
+        return hit;
+    }
+
+    const VecDataArray<double, 3>& vertices = *surfaceMesh->getVertexPositions();
+    const VecDataArray<int, 3>& triangles = *surfaceMesh->getCells();
+    for (int i = 0; i < triangles.size(); i++)
+    {
+        const Vec3i& tri = triangles[i];
+        const Vec3d& a = vertices[tri[0]];
+        const Vec3d& b = vertices[tri[1]];
+        const Vec3d& c = vertices[tri[2]];
+        const Vec3d closestPt = closestPointOnTriangle(p, a, b, c);
+        const double distance = (p - closestPt).norm();
+        if (distance >= hit.distance)
+        {
+            continue;
+        }
+
+        Vec3d normal = (b - a).cross(c - a);
+        if (normal.squaredNorm() > 1.0e-12)
+        {
+            normal.normalize();
+        }
+        else
+        {
+            normal = Vec3d::UnitY();
+        }
+
+        hit.valid = true;
+        hit.triangleId = i;
+        hit.triangle = tri;
+        hit.point = closestPt;
+        hit.barycentric = computeTriangleBarycentric(closestPt, a, b, c);
+        hit.distance = distance;
+        hit.signedDistance = (p - closestPt).dot(normal);
+    }
+    return hit;
 }
 
 static std::shared_ptr<LineMesh>
@@ -248,16 +418,28 @@ makeImportedMeniscusObject(const std::shared_ptr<PbdModel> pbdModel)
 
     const int bodyId = tissueObj->getPbdBody()->bodyHandle;
     const std::vector<Edge> tetEdges = getUniqueTetEdges(tissue.tetMesh);
-    for (const Edge& edge : tetEdges)
+    if (ENABLE_MENISCUS_DEFORMATION)
     {
-        auto constraint = std::make_shared<PbdDistanceConstraint>();
-        constraint->initConstraint(
-            tissue.tetMesh->getVertexPosition(edge[0]),
-            tissue.tetMesh->getVertexPosition(edge[1]),
-            PbdParticleId(bodyId, edge[0]),
-            PbdParticleId(bodyId, edge[1]),
-            1.0e4);
-        pbdModel->getConstraints()->addConstraint(constraint);
+        for (const Edge& edge : tetEdges)
+        {
+            auto constraint = std::make_shared<PbdDistanceConstraint>();
+            constraint->initConstraint(
+                tissue.tetMesh->getVertexPosition(edge[0]),
+                tissue.tetMesh->getVertexPosition(edge[1]),
+                PbdParticleId(bodyId, edge[0]),
+                PbdParticleId(bodyId, edge[1]),
+                MENISCUS_EDGE_STIFFNESS);
+            pbdModel->getConstraints()->addConstraint(constraint);
+        }
+    }
+    else
+    {
+        tissueObj->getPbdBody()->fixedNodeIds.clear();
+        tissueObj->getPbdBody()->fixedNodeIds.reserve(tissue.tetMesh->getNumVertices());
+        for (int i = 0; i < tissue.tetMesh->getNumVertices(); i++)
+        {
+            tissueObj->getPbdBody()->fixedNodeIds.push_back(i);
+        }
     }
     pbdModel->getConfig()->setBodyDamping(bodyId, 0.055, 0.0);
 
@@ -267,7 +449,7 @@ makeImportedMeniscusObject(const std::shared_ptr<PbdModel> pbdModel)
         material->setDisplayMode(RenderMaterial::DisplayMode::Surface);
         material->setOpacity(1.0);
         material->setBackFaceCulling(false);
-        material->setIsDynamicMesh(true);
+        material->setIsDynamicMesh(ENABLE_MENISCUS_DEFORMATION);
         material->setShadingModel(RenderMaterial::ShadingModel::Phong);
         material->setDiffuseColor(Color(0.76, 0.76, 0.72));
     }
@@ -275,7 +457,7 @@ makeImportedMeniscusObject(const std::shared_ptr<PbdModel> pbdModel)
     std::cout << "PBDMeniscusHapticSuture: loaded "
               << tissue.tetMesh->getNumVertices() << " vertices, "
               << tissue.tetMesh->getNumCells() << " tetrahedra, "
-              << tetEdges.size() << " distance constraints from "
+              << (ENABLE_MENISCUS_DEFORMATION ? tetEdges.size() : 0) << " distance constraints from "
               << IMPORTED_MENISCUS_VTK_PATH << std::endl;
     std::cout << "PBDMeniscusHapticSuture: fixed "
               << tissueObj->getPbdBody()->fixedNodeIds.size()
@@ -283,136 +465,186 @@ makeImportedMeniscusObject(const std::shared_ptr<PbdModel> pbdModel)
     return tissue;
 }
 
-static std::shared_ptr<RigidObject2>
-makeSutureToolObj()
+static std::shared_ptr<PbdObject>
+makeLapToolObj(const std::string& name, const std::shared_ptr<PbdModel> model, const Vec3d& initPos)
 {
-    auto toolGeom = std::make_shared<LineMesh>();
-    auto vertices = std::make_shared<VecDataArray<double, 3>>(2);
-    (*vertices)[0] = Vec3d(0.0, 0.0, 0.0);
-    (*vertices)[1] = Vec3d(0.0, 2.5, 0.0);
-    auto indices = std::make_shared<VecDataArray<int, 2>>(1);
-    (*indices)[0] = Vec2i(0, 1);
-    toolGeom->initialize(vertices, indices);
+    auto lapTool = std::make_shared<PbdObject>(name);
 
-    auto toolObj = std::make_shared<RigidObject2>("Haptic suture ray tool");
-    toolObj->setCollidingGeometry(toolGeom);
-    toolObj->setPhysicsGeometry(toolGeom);
+    const double capsuleLength = 0.3 * LAP_TOOL_SCALE;
+    auto toolGeom = std::make_shared<Capsule>(
+        Vec3d(0.0, 0.0, capsuleLength * 0.5 - 0.005),
+        0.002 * LAP_TOOL_SCALE,
+        capsuleLength,
+        Quatd(Rotd(PI_2, Vec3d::UnitX())));
 
-    std::shared_ptr<SurfaceMesh> forcepsMesh = MeshIO::read<SurfaceMesh>(FORCEPS_TOOL_PATH);
-    if (forcepsMesh != nullptr)
+    const double lapToolHeadLength = GRASP_CAPSULE_LENGTH;
+    auto graspCapsule = std::make_shared<Capsule>(
+        Vec3d(0.0, 0.0, lapToolHeadLength * 0.5),
+        GRASP_CAPSULE_RADIUS,
+        lapToolHeadLength,
+        Quatd::FromTwoVectors(Vec3d::UnitY(), Vec3d::UnitZ()));
+
+    std::shared_ptr<SurfaceMesh> visualGeom =
+        MeshIO::read<SurfaceMesh>(std::string(DEMO_IMSTK_DATA_ROOT)
+            + "/Surgical Instruments/LapTool/laptool_all_in_one.obj");
+
+    lapTool->setDynamicalModel(model);
+    lapTool->setPhysicsGeometry(toolGeom);
+    lapTool->setCollidingGeometry(toolGeom);
+    if (visualGeom != nullptr)
     {
-        Vec3d boundsMin = Vec3d::Zero();
-        Vec3d boundsMax = Vec3d::Zero();
-        forcepsMesh->computeBoundingBox(boundsMin, boundsMax);
-        const Vec3d extent = boundsMax - boundsMin;
-        const double maxExtent = std::max(extent[0], std::max(extent[1], extent[2]));
-        const double scale = (maxExtent > 1.0e-8) ? 2.5 / maxExtent : 1.0;
-
-        auto computeBandCenter = [&](const double yMin, const double yMax) -> Vec3d
-            {
-                Vec3d center = Vec3d::Zero();
-                int count = 0;
-                const VecDataArray<double, 3>& positions = *forcepsMesh->getVertexPositions();
-                for (int i = 0; i < positions.size(); i++)
-                {
-                    const Vec3d& p = positions[i];
-                    if (p[1] < yMin || p[1] > yMax)
-                    {
-                        continue;
-                    }
-                    center += p;
-                    count++;
-                }
-                if (count == 0)
-                {
-                    return Vec3d(
-                        (boundsMin[0] + boundsMax[0]) * 0.5,
-                        (yMin + yMax) * 0.5,
-                        (boundsMin[2] + boundsMax[2]) * 0.5);
-                }
-                return center / static_cast<double>(count);
-            };
-
-        const double yExtent = std::max(1.0e-8, extent[1]);
-        const Vec3d axisBase = computeBandCenter(boundsMin[1], boundsMin[1] + yExtent * 0.06);
-        const Vec3d axisHead = computeBandCenter(
-            boundsMin[1] + yExtent * 0.38,
-            boundsMin[1] + yExtent * 0.50);
-        const Vec3d sourceAxis = axisHead - axisBase;
-        const Quatd alignAxis = (sourceAxis.norm() > 1.0e-8) ?
-            Quatd::FromTwoVectors(sourceAxis.normalized(), Vec3d::UnitY()) :
-            Quatd::Identity();
-        const Mat4d transform =
-            mat4dScale(Vec3d(scale, scale, scale)) *
-            mat4dRotation(alignAxis) *
-            mat4dTranslate(-axisBase);
-        forcepsMesh->transform(transform, Geometry::TransformType::ApplyToData);
-
-        toolObj->setVisualGeometry(forcepsMesh);
-        toolObj->setPhysicsToVisualMap(std::make_shared<IsometricMap>(toolGeom, forcepsMesh));
-
-        std::shared_ptr<RenderMaterial> forcepsMaterial =
-            toolObj->getVisualModel(0)->getRenderMaterial();
-        forcepsMaterial->setDisplayMode(RenderMaterial::DisplayMode::Surface);
-        forcepsMaterial->setDiffuseColor(Color(0.74, 0.76, 0.78));
-        forcepsMaterial->setShadingModel(RenderMaterial::ShadingModel::PBR);
-        forcepsMaterial->setRoughness(0.28);
-        forcepsMaterial->setMetalness(0.75);
-        forcepsMaterial->setIsDynamicMesh(true);
-        forcepsMaterial->setBackFaceCulling(false);
+        visualGeom->scale(LAP_TOOL_SCALE, Geometry::TransformType::ApplyToData);
+        lapTool->setVisualGeometry(visualGeom);
+        lapTool->setPhysicsToVisualMap(std::make_shared<IsometricMap>(toolGeom, visualGeom));
     }
     else
     {
-        toolObj->setVisualGeometry(toolGeom);
+        lapTool->setVisualGeometry(toolGeom);
     }
 
-    auto rayMaterial = std::make_shared<RenderMaterial>();
-    rayMaterial->setDisplayMode(RenderMaterial::DisplayMode::Wireframe);
-    rayMaterial->setColor(Color(0.05, 1.0, 0.25));
-    rayMaterial->setLineWidth(5.0);
-    rayMaterial->setShadingModel(RenderMaterial::ShadingModel::PBR);
-    rayMaterial->setRoughness(0.35);
-    rayMaterial->setMetalness(0.0);
-    rayMaterial->setIsDynamicMesh(false);
+    auto graspVisualModel = std::make_shared<VisualModel>();
+    graspVisualModel->setGeometry(graspCapsule);
+    graspVisualModel->getRenderMaterial()->setIsDynamicMesh(false);
+    graspVisualModel->getRenderMaterial()->setOpacity(0.35);
+    graspVisualModel->getRenderMaterial()->setColor(Color::Green);
+    graspVisualModel->setIsVisible(true);
+    lapTool->addVisualModel(graspVisualModel);
 
-    imstkNew<VisualModel> rayVisual;
-    rayVisual->setGeometry(toolGeom);
-    rayVisual->setRenderMaterial(rayMaterial);
-    toolObj->addVisualModel(rayVisual);
+    std::shared_ptr<RenderMaterial> material = lapTool->getVisualModel(0)->getRenderMaterial();
+    material->setIsDynamicMesh(false);
+    material->setMetalness(1.0);
+    material->setRoughness(0.2);
+    material->setShadingModel(RenderMaterial::ShadingModel::PBR);
 
-    auto rbdModel = std::make_shared<RigidBodyModel2>();
-    rbdModel->getConfig()->m_gravity = Vec3d::Zero();
-    rbdModel->getConfig()->m_maxNumIterations = 5;
-    toolObj->setDynamicalModel(rbdModel);
+    lapTool->getPbdBody()->setRigid(
+        initPos,
+        5.0,
+        Quatd::Identity(),
+        Mat3d::Identity() * 0.08);
 
-    toolObj->getRigidBody()->m_mass = 0.3;
-    toolObj->getRigidBody()->m_intertiaTensor = Mat3d::Identity() * 10000.0;
-    toolObj->getRigidBody()->m_initPos = Vec3d(1.1, 1.2, 0.0);
-    toolObj->getRigidBody()->m_initOrientation = Quatd(Rotd(0.0, Vec3d::UnitZ()));
-
-    auto controller = toolObj->addComponent<RigidObjectController>();
-    controller->setControlledObject(toolObj);
-    controller->setLinearKs(1000.0);
-    controller->setAngularKs(10000000.0);
-    controller->setUseCritDamping(true);
-    controller->setForceScaling(0.0045);
+    auto controller = lapTool->addComponent<PbdObjectController>();
+    controller->setControlledObject(lapTool);
+    controller->setLinearKs(10000.0);
+    controller->setAngularKs(10.0);
+    controller->setForceScaling(0.01);
     controller->setSmoothingKernelSize(15);
     controller->setUseForceSmoothening(true);
-    controller->setTranslationScaling(1.0);
-    controller->setTranslationOffset(Vec3d::Zero());
+    controller->setHapticOffset(Vec3d(0.0, 0.0, capsuleLength));
 
-    return toolObj;
+    auto graspCapsuleMap = std::make_shared<IsometricMap>(toolGeom, graspCapsule);
+    auto graspCapsuleUpdate = lapTool->addComponent<LambdaBehaviour>(name + "GraspCapsuleUpdate");
+    graspCapsuleUpdate->setUpdate([graspCapsuleMap](const double&)
+        {
+            graspCapsuleMap->update();
+        });
+
+    return lapTool;
 }
 
-static Vec3d
-getToolTipPosition(const std::shared_ptr<RigidObject2> toolObj)
+static std::shared_ptr<PbdObject>
+makeNeedleObj(const std::shared_ptr<PbdModel> model, const Vec3d& initPos)
 {
-    auto toolGeom = std::dynamic_pointer_cast<LineMesh>(toolObj->getCollidingGeometry());
-    if (toolGeom == nullptr || toolGeom->getNumVertices() == 0)
+    auto needleObj = std::make_shared<PbdObject>("sutureNeedle");
+
+    std::shared_ptr<SurfaceMesh> needleMesh =
+        MeshIO::read<SurfaceMesh>(std::string(DEMO_IMSTK_DATA_ROOT)
+            + "/Surgical Instruments/Needles/c6_suture.stl");
+    std::shared_ptr<LineMesh> needleLineMesh =
+        MeshIO::read<LineMesh>(std::string(DEMO_IMSTK_DATA_ROOT)
+            + "/Surgical Instruments/Needles/c6_suture_hull.vtk");
+    if (needleLineMesh == nullptr)
     {
-        return toolObj->getRigidBody()->m_initPos;
+        auto vertices = std::make_shared<VecDataArray<double, 3>>(2);
+        (*vertices)[0] = Vec3d(-0.02, 0.0, 0.0);
+        (*vertices)[1] = Vec3d(0.02, 0.0, 0.0);
+        auto indices = std::make_shared<VecDataArray<int, 2>>(1);
+        (*indices)[0] = Vec2i(0, 1);
+        needleLineMesh = std::make_shared<LineMesh>();
+        needleLineMesh->initialize(vertices, indices);
     }
-    return toolGeom->getVertexPosition(0);
+    if (needleMesh != nullptr)
+    {
+        needleMesh->translate(Vec3d(0.0, -0.0047, -0.0087), Geometry::TransformType::ApplyToData);
+        needleLineMesh->translate(Vec3d(0.0, -0.0047, -0.0087), Geometry::TransformType::ApplyToData);
+        needleMesh->scale(NEEDLE_SCALE, Geometry::TransformType::ApplyToData);
+        needleLineMesh->scale(NEEDLE_SCALE, Geometry::TransformType::ApplyToData);
+        needleObj->setVisualGeometry(needleMesh);
+        needleObj->setPhysicsToVisualMap(std::make_shared<IsometricMap>(needleLineMesh, needleMesh));
+        needleObj->getVisualModel(0)->getRenderMaterial()->setColor(Color::Orange);
+        needleObj->getVisualModel(0)->getRenderMaterial()->setBackFaceCulling(false);
+
+        auto needleHullMaterial = std::make_shared<RenderMaterial>();
+        needleHullMaterial->setDisplayMode(RenderMaterial::DisplayMode::Wireframe);
+        needleHullMaterial->setColor(Color::Yellow);
+        needleHullMaterial->setLineWidth(4.0);
+        imstkNew<VisualModel> needleHullVisual;
+        needleHullVisual->setGeometry(needleLineMesh);
+        needleHullVisual->setRenderMaterial(needleHullMaterial);
+        needleObj->addVisualModel(needleHullVisual);
+    }
+    else
+    {
+        needleObj->setVisualGeometry(needleLineMesh);
+    }
+    needleObj->setCollidingGeometry(needleLineMesh);
+    needleObj->setPhysicsGeometry(needleLineMesh);
+    needleObj->setDynamicalModel(model);
+    needleObj->getPbdBody()->setRigid(initPos, 1.0, Quatd::Identity(), Mat3d::Identity() * 0.01);
+
+    return needleObj;
+}
+
+static std::shared_ptr<PbdObject>
+makePbdString(const std::string& name,
+              const Vec3d& pos,
+              const Vec3d& dir,
+              const int numVerts,
+              const double stringLength,
+              const std::shared_ptr<PbdObject> needleObj)
+{
+    auto stringObj = std::make_shared<PbdObject>(name);
+    std::shared_ptr<LineMesh> stringMesh =
+        GeometryUtils::toLineGrid(pos, dir, stringLength, numVerts);
+
+    auto material = std::make_shared<RenderMaterial>();
+    material->setBackFaceCulling(false);
+    material->setColor(Color::Red);
+    material->setLineWidth(2.0);
+    material->setPointSize(6.0);
+    material->setDisplayMode(RenderMaterial::DisplayMode::Wireframe);
+
+    stringObj->setVisualGeometry(stringMesh);
+    stringObj->getVisualModel(0)->setRenderMaterial(material);
+    stringObj->setPhysicsGeometry(stringMesh);
+    stringObj->setCollidingGeometry(stringMesh);
+
+    std::shared_ptr<PbdModel> model = needleObj->getPbdModel();
+    stringObj->setDynamicalModel(model);
+    stringObj->getPbdBody()->uniformMassValue = 0.02;
+
+    const int bodyHandle = stringObj->getPbdBody()->bodyHandle;
+    model->getConfig()->enableConstraint(
+        PbdModelConfig::ConstraintGenType::Distance,
+        1000.0,
+        bodyHandle);
+    model->getConfig()->enableBendConstraint(1.0, 1, true, bodyHandle);
+
+    auto needleLineMesh = std::dynamic_pointer_cast<LineMesh>(needleObj->getPhysicsGeometry());
+    model->getConfig()->addPbdConstraintFunctor([=](PbdConstraintContainer& container)
+        {
+            const Vec3d endOfNeedle = (*needleLineMesh->getVertexPositions())[0];
+            auto attachmentConstraint = std::make_shared<PbdBodyToBodyDistanceConstraint>();
+            attachmentConstraint->initConstraint(
+                model->getBodies(),
+                { needleObj->getPbdBody()->bodyHandle, 0 },
+                endOfNeedle,
+                { stringObj->getPbdBody()->bodyHandle, 0 },
+                0.0,
+                0.0000001);
+            container.addConstraint(attachmentConstraint);
+        });
+
+    return stringObj;
 }
 
 int
@@ -428,8 +660,8 @@ main()
     imstkNew<PbdModel> pbdModel;
     pbdModel->getConfig()->m_doPartitioning = true;
     pbdModel->getConfig()->m_gravity = Vec3d::Zero();
-    pbdModel->getConfig()->m_dt = 0.001;
-    pbdModel->getConfig()->m_iterations = 4;
+    pbdModel->getConfig()->m_dt = PBD_TIME_STEP;
+    pbdModel->getConfig()->m_iterations = PBD_SOLVER_ITERATIONS;
     pbdModel->getConfig()->m_solverType = PbdConstraint::SolverType::xPBD;
 
     MeniscusTissue meniscusTissue = makeImportedMeniscusObject(pbdModel);
@@ -443,7 +675,7 @@ main()
     scene->addSceneObject(meniscusTissue.object);
 
     imstkNew<SceneObject> edgeOverlayObj("Imported meniscus boundary edge overlay");
-    if (meniscusTissue.edgeMesh != nullptr)
+    if (SHOW_MENISCUS_EDGE_OVERLAY && meniscusTissue.edgeMesh != nullptr)
     {
         auto edgeMaterial = std::make_shared<RenderMaterial>();
         edgeMaterial->setDisplayMode(RenderMaterial::DisplayMode::Wireframe);
@@ -457,13 +689,272 @@ main()
         scene->addSceneObject(edgeOverlayObj);
     }
 
-    auto stitching = std::make_shared<PbdObjectStitching>(meniscusTissue.object);
-    stitching->setStiffness(0.65);
-    stitching->setStitchDistance(2.5);
-    scene->addInteraction(stitching);
+    const Vec3d tissueCenter = (meniscusTissue.boundsMin + meniscusTissue.boundsMax) * 0.5;
+    const Vec3d hapticWorkspaceOffset = tissueCenter + Vec3d(0.0, 1.9, 1.0);
+    const Vec3d leftToolStart = hapticWorkspaceOffset + Vec3d(0.0, 0.0, 0.15 * LAP_TOOL_SCALE);
+    const Vec3d rightToolStart = tissueCenter + Vec3d(1.2, 1.25, 1.2);
+    std::shared_ptr<PbdObject> leftToolObj =
+        makeLapToolObj("leftHapticLapTool", pbdModel, leftToolStart);
+    scene->addSceneObject(leftToolObj);
+    std::shared_ptr<PbdObject> rightToolObj =
+        makeLapToolObj("rightMouseLapTool", pbdModel, rightToolStart);
+    scene->addSceneObject(rightToolObj);
 
-    std::shared_ptr<RigidObject2> sutureToolObj = makeSutureToolObj();
-    scene->addSceneObject(sutureToolObj);
+    std::shared_ptr<PbdObject> needleObj =
+        makeNeedleObj(pbdModel, tissueCenter + Vec3d(0.25, 0.8, 0.8));
+    scene->addSceneObject(needleObj);
+
+    std::shared_ptr<PbdObject> sutureThreadObj = makePbdString(
+        "sutureThread",
+        tissueCenter + Vec3d(0.25, 0.8, 0.8),
+        Vec3d(0.0, 0.0, 1.0),
+        50,
+        2.2,
+        needleObj);
+    scene->addSceneObject(sutureThreadObj);
+
+    auto toolCollision = std::make_shared<PbdObjectCollision>(leftToolObj, rightToolObj);
+    toolCollision->setRigidBodyCompliance(0.00001);
+    scene->addInteraction(toolCollision);
+
+    if (ENABLE_TOOL_NEEDLE_CONTACT)
+    {
+        auto leftNeedleCollision = std::make_shared<PbdObjectCollision>(leftToolObj, needleObj);
+        leftNeedleCollision->setRigidBodyCompliance(0.0001);
+        leftNeedleCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(leftNeedleCollision);
+        auto rightNeedleCollision = std::make_shared<PbdObjectCollision>(rightToolObj, needleObj);
+        rightNeedleCollision->setRigidBodyCompliance(0.0001);
+        rightNeedleCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(rightNeedleCollision);
+    }
+
+    if (ENABLE_TOOL_THREAD_CONTACT)
+    {
+        auto leftThreadCollision = std::make_shared<PbdObjectCollision>(leftToolObj, sutureThreadObj);
+        leftThreadCollision->setRigidBodyCompliance(0.0001);
+        leftThreadCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(leftThreadCollision);
+        auto rightThreadCollision = std::make_shared<PbdObjectCollision>(rightToolObj, sutureThreadObj);
+        rightThreadCollision->setRigidBodyCompliance(0.0001);
+        rightThreadCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(rightThreadCollision);
+    }
+
+    if (ENABLE_NEEDLE_TISSUE_CONTACT)
+    {
+        auto needleTissueCollision = std::make_shared<PbdObjectCollision>(needleObj, meniscusTissue.object);
+        needleTissueCollision->setRigidBodyCompliance(0.00005);
+        needleTissueCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(needleTissueCollision);
+    }
+    if (ENABLE_THREAD_TISSUE_CONTACT)
+    {
+        auto threadTissueCollision = std::make_shared<PbdObjectCollision>(sutureThreadObj, meniscusTissue.object);
+        threadTissueCollision->setDeformableStiffnessA(0.05);
+        threadTissueCollision->setDeformableStiffnessB(0.05);
+        threadTissueCollision->setUseCorrectVelocity(false);
+        scene->addInteraction(threadTissueCollision);
+    }
+
+    auto leftNeedleGrasping = std::make_shared<PbdObjectGrasping>(needleObj, leftToolObj);
+    leftNeedleGrasping->setCompliance(0.00001);
+    scene->addInteraction(leftNeedleGrasping);
+    auto leftThreadGrasping = std::make_shared<PbdObjectGrasping>(sutureThreadObj, leftToolObj);
+    leftThreadGrasping->setCompliance(0.00001);
+    scene->addInteraction(leftThreadGrasping);
+    auto rightNeedleGrasping = std::make_shared<PbdObjectGrasping>(needleObj, rightToolObj);
+    rightNeedleGrasping->setCompliance(0.00001);
+    scene->addInteraction(rightNeedleGrasping);
+    auto rightThreadGrasping = std::make_shared<PbdObjectGrasping>(sutureThreadObj, rightToolObj);
+    rightThreadGrasping->setCompliance(0.00001);
+    scene->addInteraction(rightThreadGrasping);
+
+    auto nearestPointOnSegment = [](const Vec3d& p, const Vec3d& a, const Vec3d& b) -> Vec3d
+        {
+            const Vec3d ab = b - a;
+            const double denom = ab.squaredNorm();
+            if (denom < 1.0e-12)
+            {
+                return a;
+            }
+            const double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / denom));
+            return Vec3d(a + t * ab);
+        };
+
+    auto capsuleSignedDistance = [&](const std::shared_ptr<Capsule> capsule, const Vec3d& p)
+        {
+            const Vec3d center = capsule->getPosition();
+            const Vec3d axis = capsule->getOrientation().toRotationMatrix().col(1).normalized();
+            const double halfLength = capsule->getLength() * 0.5;
+            const Vec3d a = center - axis * halfLength;
+            const Vec3d b = center + axis * halfLength;
+            return (p - nearestPointOnSegment(p, a, b)).norm() - capsule->getRadius();
+        };
+
+    std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>> leftManualNeedleConstraints;
+    std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>> rightManualNeedleConstraints;
+    std::vector<PbdConstraint*> leftManualNeedleConstraintPtrs;
+    std::vector<PbdConstraint*> rightManualNeedleConstraintPtrs;
+
+    auto clearManualNeedleGrasp =
+        [](std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>>& constraints,
+           std::vector<PbdConstraint*>& constraintPtrs)
+        {
+            constraints.clear();
+            constraintPtrs.clear();
+        };
+
+    auto tryBeginManualNeedleGrasp =
+        [&](const std::string& label,
+            const std::shared_ptr<PbdObject> toolObj,
+            std::vector<std::shared_ptr<PbdBodyToBodyDistanceConstraint>>& constraints,
+            std::vector<PbdConstraint*>& constraintPtrs)
+        {
+            if (!constraints.empty())
+            {
+                return true;
+            }
+
+            auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
+                toolObj->getVisualModel(1)->getGeometry());
+            auto needleLineMesh = std::dynamic_pointer_cast<LineMesh>(needleObj->getPhysicsGeometry());
+            if (graspCapsule == nullptr || needleLineMesh == nullptr || needleLineMesh->getNumVertices() == 0)
+            {
+                return false;
+            }
+
+            const VecDataArray<double, 3>& needleVertices = *needleLineMesh->getVertexPositions();
+            int closestVertex = -1;
+            double closestSignedDistance = std::numeric_limits<double>::max();
+            for (int i = 0; i < needleVertices.size(); i++)
+            {
+                const double signedDistance = capsuleSignedDistance(graspCapsule, needleVertices[i]);
+                if (signedDistance < closestSignedDistance)
+                {
+                    closestSignedDistance = signedDistance;
+                    closestVertex = i;
+                }
+            }
+
+            std::cout << "PBDMeniscusHapticSuture: " << label
+                      << " manual needle grasp nearest distance "
+                      << closestSignedDistance << std::endl;
+
+            if (closestVertex < 0 || closestSignedDistance > MANUAL_NEEDLE_GRASP_TOLERANCE)
+            {
+                return false;
+            }
+
+            std::vector<int> needleLockVertices = { closestVertex };
+            const int tipVertex = static_cast<int>(needleVertices.size()) - 1;
+            if (tipVertex != closestVertex)
+            {
+                needleLockVertices.push_back(tipVertex);
+            }
+            if (closestVertex != 0 && tipVertex != 0)
+            {
+                needleLockVertices.push_back(0);
+            }
+
+            for (const int vertexId : needleLockVertices)
+            {
+                const Vec3d& lockPt = needleVertices[vertexId];
+                auto constraint = std::make_shared<PbdBodyToBodyDistanceConstraint>();
+                constraint->initConstraint(
+                    pbdModel->getBodies(),
+                    { toolObj->getPbdBody()->bodyHandle, 0 },
+                    lockPt,
+                    { needleObj->getPbdBody()->bodyHandle, 0 },
+                    lockPt,
+                    0.0,
+                    0.000001);
+                constraints.push_back(constraint);
+                constraintPtrs.push_back(constraint.get());
+            }
+
+            std::cout << "PBDMeniscusHapticSuture: " << label
+                      << " manual needle grasp active with "
+                      << constraints.size() << " constraints." << std::endl;
+            return true;
+        };
+
+    std::vector<std::shared_ptr<PbdBaryPointToPointConstraint>> sutureAnchorConstraints;
+    std::set<int> anchoredThreadVertices;
+    bool havePreviousNeedleTipHit = false;
+    double previousNeedleTipSignedDistance = 0.0;
+    int anchorCooldownFrames = 0;
+
+    auto addSutureAnchor = [&](const SurfaceHit& hit)
+        {
+            if (!hit.valid || static_cast<int>(sutureAnchorConstraints.size()) >= MAX_SUTURE_ANCHORS)
+            {
+                return;
+            }
+
+            auto threadMesh = std::dynamic_pointer_cast<LineMesh>(sutureThreadObj->getPhysicsGeometry());
+            if (threadMesh == nullptr || threadMesh->getNumVertices() < 2)
+            {
+                return;
+            }
+
+            const VecDataArray<double, 3>& threadVertices = *threadMesh->getVertexPositions();
+            int closestThreadVertex = -1;
+            double closestThreadDistance = std::numeric_limits<double>::max();
+            for (int i = 1; i < threadVertices.size(); i++)
+            {
+                if (anchoredThreadVertices.count(i) > 0)
+                {
+                    continue;
+                }
+
+                const double distance = (threadVertices[i] - hit.point).squaredNorm();
+                if (distance < closestThreadDistance)
+                {
+                    closestThreadDistance = distance;
+                    closestThreadVertex = i;
+                }
+            }
+            if (closestThreadVertex < 0)
+            {
+                return;
+            }
+
+            auto constraint = std::make_shared<PbdBaryPointToPointConstraint>();
+            constraint->initConstraint(
+                { PbdParticleId(sutureThreadObj->getPbdBody()->bodyHandle, closestThreadVertex) },
+                { 1.0 },
+                {
+                    PbdParticleId(meniscusTissue.object->getPbdBody()->bodyHandle, hit.triangle[0]),
+                    PbdParticleId(meniscusTissue.object->getPbdBody()->bodyHandle, hit.triangle[1]),
+                    PbdParticleId(meniscusTissue.object->getPbdBody()->bodyHandle, hit.triangle[2])
+                },
+                { hit.barycentric[0], hit.barycentric[1], hit.barycentric[2] },
+                0.85,
+                0.85);
+            pbdModel->getConstraints()->addConstraint(constraint);
+            sutureAnchorConstraints.push_back(constraint);
+            anchoredThreadVertices.insert(closestThreadVertex);
+            anchorCooldownFrames = 30;
+
+            std::cout << "PBDMeniscusHapticSuture: added suture anchor "
+                      << sutureAnchorConstraints.size()
+                      << " at tissue triangle " << hit.triangleId
+                      << " using thread vertex " << closestThreadVertex << std::endl;
+        };
+
+    if (ENABLE_THREAD_SELF_COLLISION)
+    {
+        auto threadSelfCollision = std::make_shared<PbdObjectCollision>(sutureThreadObj, sutureThreadObj);
+        threadSelfCollision->setDeformableStiffnessA(0.05);
+        threadSelfCollision->setDeformableStiffnessB(0.05);
+        scene->addInteraction(threadSelfCollision);
+    }
+
+    auto mousePlane = std::make_shared<Plane>(
+        tissueCenter + Vec3d(0.0, 1.2, 1.4),
+        Vec3d(0.1, 0.0, 1.0));
+    mousePlane->setWidth(6.0);
 
     imstkNew<DirectionalLight> light;
     light->setFocalPoint(Vec3d(-1.0, -1.0, -1.0));
@@ -481,83 +972,76 @@ main()
     imstkNew<SimulationManager> driver;
     driver->addModule(viewer);
     driver->addModule(sceneManager);
-    driver->setDesiredDt(1.0 / 240.0);
+    driver->setDesiredDt(DRIVER_TIME_STEP);
+
+    bool leftGraspActive = false;
+    bool rightGraspActive = false;
+    double rightDummyOffset = -0.07 * LAP_TOOL_SCALE;
 
 #ifdef iMSTK_USE_HAPTICS
     std::shared_ptr<DeviceManager> hapticManager = DeviceManagerFactory::makeDeviceManager();
-    std::shared_ptr<DeviceClient> hapticDeviceClient = hapticManager->makeDeviceClient();
-    auto deviceClient = std::make_shared<DummyClient>();
+    std::shared_ptr<DeviceClient> leftDeviceClient = hapticManager->makeDeviceClient("Default Device");
     driver->addModule(hapticManager);
 
-    const Vec3d workspaceCenter =
-        (meniscusTissue.boundsMin + meniscusTissue.boundsMax) * 0.5 + Vec3d(0.0, 1.35, 1.55);
-    connect<Event>(sceneManager, &SceneManager::preUpdate,
-        [&](Event*)
-        {
-            const Vec3d rawPos = hapticDeviceClient->getPosition();
-            constexpr double kHapticWorkspaceScale = 8.5;
-            const Vec3d mappedPos(
-                rawPos[0] * kHapticWorkspaceScale + workspaceCenter[0],
-                rawPos[1] * kHapticWorkspaceScale + workspaceCenter[1],
-                rawPos[2] * kHapticWorkspaceScale + workspaceCenter[2]);
-            deviceClient->setPosition(mappedPos);
+    auto leftController = leftToolObj->getComponent<PbdObjectController>();
+    leftController->setDevice(leftDeviceClient);
+    leftController->setTranslationScaling(HAPTIC_TRANSLATION_SCALING);
+    leftController->setTranslationOffset(hapticWorkspaceOffset);
+    leftController->setUseSpring(ENABLE_HAPTIC_FORCE_FEEDBACK);
+    leftController->setForceScaling(ENABLE_HAPTIC_FORCE_FEEDBACK ? 0.01 : 0.0);
+    leftDeviceClient->setForceEnabled(ENABLE_HAPTIC_FORCE_FEEDBACK);
+    leftDeviceClient->setForce(Vec3d::Zero());
 
-            const Quatd rawOrientation = hapticDeviceClient->getOrientation();
-            const Quatd deviceToScene(Rotd(-PI_2, Vec3d::UnitX()));
-            const Quatd toolAxisToDeviceShaft =
-                Quatd::FromTwoVectors(Vec3d::UnitY(), Vec3d::UnitZ());
-            deviceClient->setOrientation(deviceToScene * rawOrientation * toolAxisToDeviceShaft);
-        });
-#else
-    auto deviceClient = std::make_shared<DummyClient>();
-    connect<Event>(sceneManager, &SceneManager::postUpdate,
-        [&](Event*)
-        {
-            const Vec2d& mousePos = viewer->getMouseDevice()->getPos();
-            deviceClient->setPosition(Vec3d(mousePos[0] * 4.0, 0.0, mousePos[1] * 3.0));
-            deviceClient->setOrientation(Quatd(Rotd(0.0, Vec3d::UnitZ())));
-        });
-#endif
-
-    auto sutureToolController = sutureToolObj->getComponent<RigidObjectController>();
-    sutureToolController->setDevice(deviceClient);
-
-    int stitchCount = 0;
-    double latestSceneDt = driver->getDesiredDt();
-
-    auto performToolStitch = [&]()
-        {
-            auto toolGeom = std::dynamic_pointer_cast<LineMesh>(sutureToolObj->getCollidingGeometry());
-            if (toolGeom == nullptr)
+    if (!ENABLE_HAPTIC_FORCE_FEEDBACK)
+    {
+        connect<Event>(sceneManager, &SceneManager::postUpdate,
+            [&](Event*)
             {
-                return;
-            }
+                leftDeviceClient->setForce(Vec3d::Zero());
+            });
+    }
 
-            const Vec3d& v1 = toolGeom->getVertexPosition(0);
-            const Vec3d& v2 = toolGeom->getVertexPosition(1);
-            const Vec3d direction = v1 - v2;
-            if (direction.norm() < 1.0e-8)
-            {
-                return;
-            }
-
-            stitching->beginStitch(v1, direction.normalized(), 4.0);
-            stitchCount++;
-            std::cout << "PBDMeniscusHapticSuture: stitch " << stitchCount
-                      << " from [" << v1.transpose() << "] along ["
-                      << direction.normalized().transpose() << "]" << std::endl;
-        };
-
-#ifdef iMSTK_USE_HAPTICS
-    queueConnect<ButtonEvent>(hapticDeviceClient, &DeviceClient::buttonStateChanged, sceneManager,
+    connect<ButtonEvent>(leftDeviceClient, &DeviceClient::buttonStateChanged,
         [&](ButtonEvent* e)
         {
-            if (e->m_button == 0 && e->m_buttonState == BUTTON_PRESSED)
+            if (e->m_button != 0 && e->m_button != 1)
             {
-                performToolStitch();
+                return;
+            }
+
+            if (e->m_buttonState == BUTTON_PRESSED)
+            {
+                auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
+                    leftToolObj->getVisualModel(1)->getGeometry());
+                tryBeginManualNeedleGrasp(
+                    "left haptic",
+                    leftToolObj,
+                    leftManualNeedleConstraints,
+                    leftManualNeedleConstraintPtrs);
+                leftThreadGrasping->beginCellGrasp(graspCapsule);
+                leftGraspActive = true;
+                std::cout << "PBDMeniscusHapticSuture: left haptic grasp button "
+                          << e->m_button << " pressed." << std::endl;
+            }
+            else if (e->m_buttonState == BUTTON_RELEASED)
+            {
+                clearManualNeedleGrasp(leftManualNeedleConstraints, leftManualNeedleConstraintPtrs);
+                leftThreadGrasping->endGrasp();
+                leftGraspActive = false;
+                std::cout << "PBDMeniscusHapticSuture: left haptic grasp button "
+                          << e->m_button << " released." << std::endl;
             }
         });
+#else
+    std::cout << "PBDMeniscusHapticSuture: haptics are not compiled; the left tool is stationary." << std::endl;
 #endif
+
+    auto rightDeviceClient = std::make_shared<DummyClient>();
+    auto rightController = rightToolObj->getComponent<PbdObjectController>();
+    rightController->setDevice(rightDeviceClient);
+    rightController->setUseSpring(false);
+
+    double latestSceneDt = driver->getDesiredDt();
 
     scene->addSceneObject(SimulationUtils::createDefaultSceneControl(driver));
 
@@ -566,7 +1050,7 @@ main()
     diagnosticsText->setPosition(TextVisualModel::DisplayPosition::LowerLeft);
     diagnosticsText->setFontSize(24.0);
     diagnosticsText->setTextColor(Color::White);
-    diagnosticsText->setText("FPS: -- | sim dt: -- ms | stitches: --");
+    diagnosticsText->setText("FPS: -- | sim dt: -- ms | anchors: -- | btn: -- | LN/LT/RN/RT: --");
 
     double visualDtAccum = 0.0;
     int visualFrameCount = 0;
@@ -585,7 +1069,13 @@ main()
             stream << std::fixed << std::setprecision(1)
                    << "FPS: " << visualFps
                    << " | sim dt: " << latestSceneDt * 1000.0 << " ms"
-                   << " | stitches: " << stitchCount;
+                   << " | anchors: " << sutureAnchorConstraints.size()
+                   << " | btn: " << (leftGraspActive ? "L" : "-") << (rightGraspActive ? "R" : "-")
+                   << " | LN/LT/RN/RT: "
+                   << (!leftManualNeedleConstraints.empty() ? "1" : "0")
+                   << (leftThreadGrasping->hasConstraints() ? "1" : "0")
+                   << (!rightManualNeedleConstraints.empty() ? "1" : "0")
+                   << (rightThreadGrasping->hasConstraints() ? "1" : "0");
             diagnosticsText->setText(stream.str());
 
             visualDtAccum = 0.0;
@@ -597,47 +1087,163 @@ main()
         [&](Event*)
         {
             latestSceneDt = sceneManager->getDt();
-            pbdModel->getConfig()->m_dt = latestSceneDt;
         });
 
     connect<Event>(sceneManager, &SceneManager::postUpdate,
         [&](Event*)
         {
-            meniscusTissue.tetMesh->getVertexPositions()->postModified();
-            meniscusTissue.tetMesh->postModified();
-            meniscusTissue.surfaceMesh->getVertexPositions()->postModified();
-            meniscusTissue.surfaceMesh->postModified();
-            if (meniscusTissue.edgeMesh != nullptr)
+            std::shared_ptr<MouseDeviceClient> mouseDeviceClient = viewer->getMouseDevice();
+            const Vec2d& mousePos = mouseDeviceClient->getPos();
+            auto geom = std::dynamic_pointer_cast<Capsule>(rightToolObj->getPhysicsGeometry());
+            Vec3d a = Vec3d::UnitY();
+            Vec3d b = a.cross(mousePlane->getNormal()).normalized();
+            a = b.cross(mousePlane->getNormal());
+            const double width = mousePlane->getWidth();
+            const Vec3d toolAxis =
+                (geom != nullptr) ? geom->getOrientation().toRotationMatrix().col(1).normalized() : Vec3d::UnitY();
+            rightDeviceClient->setPosition(
+                mousePlane->getPosition()
+                + a * width * (mousePos[1] - 0.5)
+                + b * width * (mousePos[0] - 0.5)
+                + toolAxis * rightDummyOffset);
+
+            if (ENABLE_AUTO_SUTURE_ANCHORS)
             {
-                meniscusTissue.edgeMesh->getVertexPositions()->postModified();
-                meniscusTissue.edgeMesh->postModified();
+                if (anchorCooldownFrames > 0)
+                {
+                    anchorCooldownFrames--;
+                }
+
+                auto needleLineMesh = std::dynamic_pointer_cast<LineMesh>(needleObj->getPhysicsGeometry());
+                if (needleLineMesh != nullptr && needleLineMesh->getNumVertices() > 1)
+                {
+                    const VecDataArray<double, 3>& needleVertices = *needleLineMesh->getVertexPositions();
+                    const Vec3d& needleTip = needleVertices[needleVertices.size() - 1];
+                    const SurfaceHit hit = findClosestSurfaceHit(meniscusTissue.surfaceMesh, needleTip);
+                    if (hit.valid)
+                    {
+                        const bool crossedSurface =
+                            havePreviousNeedleTipHit
+                            && previousNeedleTipSignedDistance * hit.signedDistance < 0.0
+                            && std::abs(previousNeedleTipSignedDistance) > PUNCTURE_SIGN_EPSILON
+                            && std::abs(hit.signedDistance) > PUNCTURE_SIGN_EPSILON
+                            && hit.distance < PUNCTURE_SURFACE_DISTANCE;
+                        if (crossedSurface && anchorCooldownFrames == 0)
+                        {
+                            addSutureAnchor(hit);
+                        }
+
+                        previousNeedleTipSignedDistance = hit.signedDistance;
+                        havePreviousNeedleTipHit = true;
+                    }
+                }
+            }
+
+            if (leftGraspActive)
+            {
+                if (leftManualNeedleConstraints.empty())
+                {
+                    tryBeginManualNeedleGrasp(
+                        "left haptic",
+                        leftToolObj,
+                        leftManualNeedleConstraints,
+                        leftManualNeedleConstraintPtrs);
+                }
+                leftThreadGrasping->regrasp();
+            }
+            if (rightGraspActive)
+            {
+                if (rightManualNeedleConstraints.empty())
+                {
+                    tryBeginManualNeedleGrasp(
+                        "right mouse",
+                        rightToolObj,
+                        rightManualNeedleConstraints,
+                        rightManualNeedleConstraintPtrs);
+                }
+                rightThreadGrasping->regrasp();
+            }
+
+            if (!leftManualNeedleConstraintPtrs.empty())
+            {
+                pbdModel->getSolver()->addConstraints(&leftManualNeedleConstraintPtrs);
+            }
+            if (!rightManualNeedleConstraintPtrs.empty())
+            {
+                pbdModel->getSolver()->addConstraints(&rightManualNeedleConstraintPtrs);
+            }
+
+            if (ENABLE_MENISCUS_DEFORMATION)
+            {
+                meniscusTissue.tetMesh->getVertexPositions()->postModified();
+                meniscusTissue.tetMesh->postModified();
+                meniscusTissue.surfaceMesh->getVertexPositions()->postModified();
+                meniscusTissue.surfaceMesh->computeVertexNormals();
+                meniscusTissue.surfaceMesh->postModified();
+                if (SHOW_MENISCUS_EDGE_OVERLAY && meniscusTissue.edgeMesh != nullptr)
+                {
+                    meniscusTissue.edgeMesh->getVertexPositions()->postModified();
+                    meniscusTissue.edgeMesh->postModified();
+                }
             }
         });
 
     queueConnect<KeyEvent>(viewer->getKeyboardDevice(), &KeyboardDeviceClient::keyPress, sceneManager,
         [&](KeyEvent* e)
         {
-#ifndef iMSTK_USE_HAPTICS
-            if (e->m_key == 's')
+            if (e->m_key == 'g')
             {
-                performToolStitch();
+                auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
+                    leftToolObj->getVisualModel(1)->getGeometry());
+                tryBeginManualNeedleGrasp(
+                    "left keyboard",
+                    leftToolObj,
+                    leftManualNeedleConstraints,
+                    leftManualNeedleConstraintPtrs);
+                leftThreadGrasping->beginCellGrasp(graspCapsule);
+                leftGraspActive = true;
                 return;
             }
-#endif
-            if (e->m_key == 'r')
+            if (e->m_key == 'f')
             {
-                stitching->removeStitchConstraints();
-                stitchCount = 0;
-                std::cout << "PBDMeniscusHapticSuture: cleared stitch constraints." << std::endl;
+                clearManualNeedleGrasp(leftManualNeedleConstraints, leftManualNeedleConstraintPtrs);
+                leftThreadGrasping->endGrasp();
+                leftGraspActive = false;
             }
         });
 
-    std::cout << "PBDMeniscusHapticSuture: imported tetrahedral VTK mesh is ready for haptic stitching." << std::endl;
-    std::cout << "PBDMeniscusHapticSuture: press the haptic button to place a stitch with the green ray." << std::endl;
-#ifndef iMSTK_USE_HAPTICS
-    std::cout << "PBDMeniscusHapticSuture: haptics disabled; press 's' to place a mouse-driven test stitch." << std::endl;
-#endif
-    std::cout << "PBDMeniscusHapticSuture: press 'r' to clear stitch constraints." << std::endl;
+    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseScroll,
+        [&](MouseEvent* e)
+        {
+            rightDummyOffset += e->m_scrollDx * 0.01;
+        });
+    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseButtonPress,
+        [&](MouseEvent*)
+        {
+            auto graspCapsule = std::dynamic_pointer_cast<Capsule>(
+                rightToolObj->getVisualModel(1)->getGeometry());
+            tryBeginManualNeedleGrasp(
+                "right mouse",
+                rightToolObj,
+                rightManualNeedleConstraints,
+                rightManualNeedleConstraintPtrs);
+            rightThreadGrasping->beginCellGrasp(graspCapsule);
+            rightGraspActive = true;
+        });
+    connect<MouseEvent>(viewer->getMouseDevice(), &MouseDeviceClient::mouseButtonRelease,
+        [&](MouseEvent*)
+        {
+            clearManualNeedleGrasp(rightManualNeedleConstraints, rightManualNeedleConstraintPtrs);
+            rightThreadGrasping->endGrasp();
+            rightGraspActive = false;
+        });
+
+    std::cout << "PBDMeniscusHapticSuture: imported tetrahedral VTK mesh is ready." << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: single haptic device controls the left lap tool." << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: haptic force feedback is "
+              << (ENABLE_HAPTIC_FORCE_FEEDBACK ? "enabled." : "disabled for initial testing.") << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: hold haptic button 0/1 to grasp the needle or thread; release to let go." << std::endl;
+    std::cout << "PBDMeniscusHapticSuture: the right lap tool is mouse controlled; mouse press grasps, release lets go, scroll changes depth." << std::endl;
 
     driver->start();
     return 0;

@@ -44,7 +44,7 @@ if (NOT DEFINED iMSTK_USE_RENDERING_VTK OR iMSTK_USE_RENDERING_VTK)
   target_compile_definitions(${PROJECT_NAME}
     PRIVATE
       IMPORTED_MENISCUS_VTK_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../banyueban_left_withCut_Cut2.vtk"
-      FORCEPS_TOOL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/Data/tools/forceps.obj")
+      DEMO_IMSTK_DATA_ROOT="${iMSTK_DATA_DIR}")
 
   if (iMSTK_USE_HAPTICS)
     target_compile_definitions(${PROJECT_NAME} PRIVATE iMSTK_USE_HAPTICS)
@@ -54,6 +54,19 @@ if (NOT DEFINED iMSTK_USE_RENDERING_VTK OR iMSTK_USE_RENDERING_VTK)
     target_compile_options(${PROJECT_NAME} PRIVATE -Wa,-mbig-obj)
   elseif (MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+  endif()
+
+  if (WIN32 AND iMSTK_DATA_DIR)
+    get_filename_component(IMSTK_INSTALL_ROOT "${iMSTK_DATA_DIR}" DIRECTORY)
+    file(GLOB IMSTK_RUNTIME_DLLS "${IMSTK_INSTALL_ROOT}/bin/*.dll")
+    if (IMSTK_RUNTIME_DLLS)
+      add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${IMSTK_RUNTIME_DLLS}
+          $<TARGET_FILE_DIR:${PROJECT_NAME}>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying iMSTK runtime DLLs beside ${PROJECT_NAME}")
+    endif()
   endif()
 
   set_target_properties(${PROJECT_NAME} PROPERTIES FOLDER Examples/PBD)
