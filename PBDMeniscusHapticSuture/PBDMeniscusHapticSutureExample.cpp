@@ -37,6 +37,11 @@
 #include "imstkVisualModel.h"
 #include "imstkVTKViewer.h"
 
+#include <vtkCell.h>
+#include <vtkOBJReader.h>
+#include <vtkPolyData.h>
+#include <vtkSmartPointer.h>
+
 #ifdef iMSTK_USE_HAPTICS
 #include "imstkDeviceManager.h"
 #include "imstkDeviceManagerFactory.h"
@@ -113,7 +118,7 @@ static constexpr std::array<int, 5> MENISCUS_FRAGMENT_EXCLUDED_VERTEX_IDS =
     58, 96, 97, 56, 76
 };
 static constexpr double FORCEPS_TEAR_TRIGGER_DISTANCE = 0.32;
-static constexpr double FORCEPS_TOOL_LENGTH = 0.36;
+static constexpr double FORCEPS_TOOL_LENGTH = 2.88;
 static constexpr double MENISCUS_NOTCH_ADJACENCY_BLOCK_RADIUS = 0.30;
 
 #ifndef FORCEPS_TOOL_PATH
@@ -481,6 +486,62 @@ makeOriginalBoundarySurfaceMeshForTetSubset(const std::shared_ptr<TetrahedralMes
     auto surfaceMesh = std::make_shared<SurfaceMesh>();
     surfaceMesh->initialize(subsetMesh->getVertexPositions(), surfaceCells);
     surfaceMesh->computeVertexNormals();
+    return surfaceMesh;
+}
+
+static std::shared_ptr<SurfaceMesh>
+readCompleteObjSurfaceMesh(const std::string& filePath)
+{
+    auto reader = vtkSmartPointer<vtkOBJReader>::New();
+    reader->SetFileName(filePath.c_str());
+    reader->Update();
+
+    vtkPolyData* polyData = reader->GetOutput();
+    if (polyData == nullptr || polyData->GetNumberOfPoints() == 0)
+    {
+        return nullptr;
+    }
+
+    auto vertices = std::make_shared<VecDataArray<double, 3>>();
+    vertices->reserve(static_cast<int>(polyData->GetNumberOfPoints()));
+    for (vtkIdType i = 0; i < polyData->GetNumberOfPoints(); i++)
+    {
+        double p[3] = { 0.0, 0.0, 0.0 };
+        polyData->GetPoint(i, p);
+        vertices->push_back(Vec3d(p[0], p[1], p[2]));
+    }
+
+    auto triangles = std::make_shared<VecDataArray<int, 3>>();
+    for (vtkIdType cellId = 0; cellId < polyData->GetNumberOfCells(); cellId++)
+    {
+        vtkCell* cell = polyData->GetCell(cellId);
+        if (cell == nullptr || cell->GetNumberOfPoints() < 3)
+        {
+            continue;
+        }
+
+        const int v0 = static_cast<int>(cell->GetPointId(0));
+        for (vtkIdType i = 1; i + 1 < cell->GetNumberOfPoints(); i++)
+        {
+            triangles->push_back(Vec3i(
+                v0,
+                static_cast<int>(cell->GetPointId(i)),
+                static_cast<int>(cell->GetPointId(i + 1))));
+        }
+    }
+
+    if (triangles->size() == 0)
+    {
+        return nullptr;
+    }
+
+    auto surfaceMesh = std::make_shared<SurfaceMesh>();
+    surfaceMesh->initialize(vertices, triangles);
+    surfaceMesh->computeVertexNormals();
+    std::cout << "PBDMeniscusHapticSuture: loaded complete OBJ forceps mesh with "
+              << vertices->size() << " vertices and "
+              << triangles->size() << " triangles from "
+              << filePath << "." << std::endl;
     return surfaceMesh;
 }
 
@@ -1410,7 +1471,7 @@ makeForcepsToolObj(const std::shared_ptr<PbdModel> model, const Vec3d& initPos)
     toolObj->setPhysicsGeometry(toolGeom);
     toolObj->setCollidingGeometry(toolGeom);
 
-    std::shared_ptr<SurfaceMesh> forcepsMesh = MeshIO::read<SurfaceMesh>(FORCEPS_TOOL_PATH);
+    std::shared_ptr<SurfaceMesh> forcepsMesh = readCompleteObjSurfaceMesh(FORCEPS_TOOL_PATH);
     if (forcepsMesh != nullptr)
     {
         Vec3d boundsMin = Vec3d::Zero();
