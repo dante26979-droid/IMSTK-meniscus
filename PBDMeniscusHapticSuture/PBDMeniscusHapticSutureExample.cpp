@@ -81,6 +81,7 @@ static constexpr bool ENABLE_AUTO_SUTURE_ANCHORS = true;
 static constexpr int MAX_SUTURE_ANCHORS = 8;
 static constexpr double PUNCTURE_SURFACE_DISTANCE = 0.18;
 static constexpr double PUNCTURE_SIGN_EPSILON = 0.005;
+static constexpr int PUNCTURE_ANCHOR_COOLDOWN_FRAMES = 12;
 
 struct MeniscusTissue
 {
@@ -735,7 +736,7 @@ main()
     }
 
     const Vec3d tissueCenter = (meniscusTissue.boundsMin + meniscusTissue.boundsMax) * 0.5;
-    const Vec3d hapticWorkspaceOffset = tissueCenter + Vec3d(0.0, 1.2, 0.2);
+    const Vec3d hapticWorkspaceOffset = tissueCenter + Vec3d(0.0, 0.75, -0.25);
     const Vec3d leftToolStart = hapticWorkspaceOffset + Vec3d(0.0, 0.0, 0.6);
     std::shared_ptr<PbdObject> leftToolObj =
         makeLapToolObj("leftHapticLapTool", pbdModel, leftToolStart);
@@ -1006,7 +1007,7 @@ main()
             pbdModel->getConstraints()->addConstraint(constraint);
             sutureAnchorConstraints.push_back(constraint);
             anchoredThreadVertices.insert(closestThreadVertex);
-            anchorCooldownFrames = 30;
+            anchorCooldownFrames = PUNCTURE_ANCHOR_COOLDOWN_FRAMES;
 
             std::cout << "PBDMeniscusHapticSuture: added suture anchor "
                       << sutureAnchorConstraints.size()
@@ -1214,7 +1215,9 @@ main()
         {
             syncNeedleRigidFollow(leftToolObj);
 
-            if (ENABLE_AUTO_SUTURE_ANCHORS)
+            const bool punctureDetectionActive =
+                ENABLE_AUTO_SUTURE_ANCHORS && leftGraspActive && needleRigidFollowActive;
+            if (punctureDetectionActive)
             {
                 if (anchorCooldownFrames > 0)
                 {
